@@ -25,8 +25,9 @@ local URL="https://raw.githubusercontent.com/BeyyTU/needlehub/main/chapter2-no-l
 local Players=game:GetService("Players")
 local paths={
     {name="CUTSCENE",file="chapter2-cutscene-deferred-invisible-skip-test.lua",
-        marker="Beyy Chapter 2 Cutscene-Only Standalone v6 INVISIBLE DEFERRED SKIP TEST",
-        cache="BeyyHub/chapter2_fork_independent_cutscene_v6_cinefix3.lua"},
+        base="https://raw.githubusercontent.com/sceneton/needlehub/main/",
+        marker="Beyy Chapter 2 Indexed Cutscene Visuals v1",
+        cache="BeyyHub/chapter2_fork_indexed_cutscene_v1.lua"},
     {name="HOLD",file="chapter2-puzzle-position-diagnostic.lua",
         marker="Beyy Chapter 2 Teleport-Hold and Return Diagnostic v9",
         cache="BeyyHub/chapter2_integrated_v33_return_v9_jumpfix.lua"},
@@ -53,7 +54,7 @@ local function compile(body)
     return nil,tostring(ok and err or fn)
 end
 local function request(item,attempt)
-    return game:HttpGet("https://raw.githubusercontent.com/BeyyTU/needlehub/main/"..
+    return game:HttpGet((item.base or "https://raw.githubusercontent.com/BeyyTU/needlehub/main/")..
         item.file.."?chapter2-integrated-v33="..tostring(os.time())..
         "-"..tostring(attempt))
 end
@@ -1170,7 +1171,43 @@ do
             or LocalPlayer:GetAttribute("HintViewerOpen")==true
     end
     local cachedExposedNeedle = nil
-    local nextNeedleFullScanAt = 0
+    local function createObjectiveIndex()
+        local current,parts,positions,connections=nil,{},{},{}
+        local function clear()
+            for _,connection in ipairs(connections)do connection:Disconnect()end
+            table.clear(connections);table.clear(parts);table.clear(positions);current=nil
+        end
+        local function add(object)
+            if object:IsA("BasePart")and not positions[object]then
+                parts[#parts+1]=object;positions[object]=#parts
+            end
+        end
+        local function remove(object)
+            local index=positions[object]
+            if not index then return end
+            local last=parts[#parts]
+            parts[index]=last;positions[last]=index
+            parts[#parts]=nil;positions[object]=nil
+        end
+        local function get(folder)
+            if folder~=current then
+                clear();current=folder
+                if folder then
+                    connections[1]=folder.DescendantAdded:Connect(add)
+                    connections[2]=folder.DescendantRemoving:Connect(remove)
+                    for _,object in ipairs(folder:GetDescendants())do add(object)end
+                end
+            end
+            return parts
+        end
+        return get,clear
+    end
+    local indexedObjectives,stopObjectiveIndex=createObjectiveIndex()
+    local previousObjectiveCleanup=_G.__BEYY_HUB_CLEANUP
+    _G.__BEYY_HUB_CLEANUP=function()
+        stopObjectiveIndex()
+        if previousObjectiveCleanup then pcall(previousObjectiveCleanup)end
+    end
     local lastKeyIdWarningAt = -math.huge
     local function keyHayId(part)
         if not part then return nil end
@@ -1185,6 +1222,7 @@ do
     local function exposedNeedle()
         local rootFolder=Workspace:FindFirstChild("NeedleObjectiveServer")
         local folder=rootFolder
+        local candidates=indexedObjectives(folder)
         local cached=cachedExposedNeedle
         if folder and cached and cached.Parent and cached:IsDescendantOf(folder) then
             local hidden=cached:GetAttribute("HIDDEN_WITHIN")
@@ -1195,12 +1233,10 @@ do
             end
         end
         local now=os.clock()
-        if now < nextNeedleFullScanAt then return nil end
-        nextNeedleFullScanAt=now+(BEYY_CHAPTER=="Chapter2" and 0.01 or 0.14)
         cachedExposedNeedle=nil
         if not folder then return nil end
-        for _,item in ipairs(folder:GetDescendants()) do
-            if item:IsA("BasePart") and item:GetAttribute("IsNeedleObjective")==true then
+        for _,item in ipairs(candidates) do
+            if item:IsDescendantOf(folder) and item:GetAttribute("IsNeedleObjective")==true then
                 local hidden=item:GetAttribute("HIDDEN_WITHIN")
                 if hidden == nil or hidden == false then
                     if keyHayId(item) ~= nil then
