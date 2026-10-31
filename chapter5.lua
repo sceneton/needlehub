@@ -1166,11 +1166,59 @@ local function createSundialAutomation(options)
 end
 
 
+local function createFarmerApproach(options)
+    return function(target,root,hum,farmer)
+        local floorParams=RaycastParams.new()
+        floorParams.FilterType=Enum.RaycastFilterType.Exclude;floorParams.RespectCanCollide=true
+        local exclude={options.Player.Character,farmer}
+        for _,name in ipairs({"HaystackClient","HaystackCollision","DroppedHay","RelicTablets"})do
+            local obj=options.World:FindFirstChild(name);if obj then exclude[#exclude+1]=obj end
+        end
+        floorParams.FilterDescendantsInstances=exclude
+        local viewParams=RaycastParams.new()
+        viewParams.FilterType=Enum.RaycastFilterType.Exclude;viewParams.IgnoreWater=true
+        viewParams.FilterDescendantsInstances={options.Player.Character,options.World.CurrentCamera}
+        local best,score
+        for _,radius in ipairs({2.5,4,6})do
+            for i=0,15 do
+                local angle=i*math.pi/8
+                local start=target+Vector3.new(math.cos(angle)*radius,8,math.sin(angle)*radius)
+                local hit=options.World:Raycast(start,Vector3.new(0,-40,0),floorParams)
+                if hit and hit.Normal.Y>=0.8 then
+                    local point=hit.Position+Vector3.new(0,hum.HipHeight+root.Size.Y/2,0)
+                    local range=(point-target).Magnitude
+                    if range<=6.5 and math.abs(point.Y-root.Position.Y)<12 then
+                        local eye=point+Vector3.new(0,1.5,0)
+                        local visible=false
+                        for _,name in ipairs({"Head","Torso","HumanoidRootPart"})do
+                            local part=farmer:FindFirstChild(name)
+                            if part and part:IsA("BasePart")then
+                                local ray=options.World:Raycast(eye,part.Position-eye,viewParams)
+                                if ray and ray.Instance:IsDescendantOf(farmer)then visible=true;break end
+                            end
+                        end
+                        local value=range+(point-root.Position).Magnitude*0.01
+                        if visible and(not score or value<score)then best,score=point,value end
+                    end
+                end
+            end
+        end
+        return best and(CFrame.new(best)*root.CFrame.Rotation)or nil
+    end
+end
+
+
 local function createFarmerClick(options)
     return function(farmer,allowed)
         local camera=options.World.CurrentCamera
         assert(camera,"Camera unavailable for potion hand-in")
         local savedType,savedView=camera.CameraType,camera.CFrame
+        local char=options.Player.Character
+        local head=char and(char:FindFirstChild("Head")or char:FindFirstChild("HumanoidRootPart"))
+        local eye=head and head.Position or savedView.Position
+        if head and(eye-savedView.Position).Magnitude>14 then
+            savedView=CFrame.new(eye)*savedView.Rotation
+        end
         local aimed,pressed,point
         local function handoff()
             local shared=options.Shared()
@@ -1197,10 +1245,10 @@ local function createFarmerClick(options)
         local ok,err=pcall(function()
             assert(allowed(),"Potion click cancelled")
             point=aimPoint()
-            if not point or(options.MouseLocked and options.MouseLocked())then
+            if not point or(options.MouseLocked and options.MouseLocked())or(head and(camera.CFrame.Position-eye).Magnitude>8)then
                 local target=farmer:FindFirstChild("Torso")or farmer:FindFirstChild("Head")or farmer:FindFirstChild("HumanoidRootPart")
                 assert(target,"Farmer body unavailable")
-                aimed=CFrame.lookAt(camera.CFrame.Position,target.Position)
+                aimed=CFrame.lookAt(eye,target.Position)
                 camera.CameraType=Enum.CameraType.Scriptable
                 camera.CFrame=aimed
                 options.FrameWait()
@@ -1241,6 +1289,7 @@ local function createPotionHandIn(options)
     local api={}
     local alive,busy=true,false
     local pending,character,tripRoot
+    local stationed=false
     local attempts,retryAt=0,0
     local lastStatus
     local function status(text)
@@ -1261,19 +1310,19 @@ local function createPotionHandIn(options)
         local untilAt=options.Now()+seconds
         repeat options.Wait(0.05);check()until options.Now()>=untilAt
     end
-    function api.Stop()alive=false;busy=false;pending=nil;character=nil;tripRoot=nil end
-    function api.IsBusy()return busy end
+    function api.Stop()alive=false;busy=false;stationed=false;pending=nil;character=nil;tripRoot=nil end
+    function api.IsBusy()return busy or stationed end
     function api.Tick()
         if not alive then return end
         if not options.Enabled()then
-            busy=false;pending=nil;character=nil;tripRoot=nil;attempts=0;retryAt=0;status("Disabled");return
+            busy=false;stationed=false;pending=nil;character=nil;tripRoot=nil;attempts=0;retryAt=0;status("Disabled");return
         end
         -- Acknowledgement can arrive together with a cutscene/input lock.
         -- Observe it before checking locks; do not move or send again afterwards.
-        if accepted()then pending=nil;busy=false;status("Potion accepted by farmer; boss sequence started");return end
+        if accepted()then pending=nil;busy=false;stationed=false;status("Potion accepted by farmer; boss sequence started");return end
         local char,root,hum=options.Character()
         if character and(char~=character or root~=tripRoot)then
-            character=nil;tripRoot=nil;pending=nil;busy=false;attempts=0
+            character=nil;tripRoot=nil;pending=nil;busy=false;stationed=false;attempts=0
         end
         if pending then
             if options.Now()<pending.Until then status("Waiting for farmer to accept potion");return end
@@ -1295,17 +1344,18 @@ local function createPotionHandIn(options)
             options.PauseTools();check()
             local target=farmer:GetPivot().Position
             status("Bringing potion to farmer")
-            if(root.Position-target).Magnitude>12 then
-                local pose=options.Approach(target,root,hum,farmer,12)
+            if not stationed or(root.Position-target).Magnitude>6.5 then
+                local pose=options.Approach(target,root,hum,farmer,6.5)
                 assert(pose,"No floor-supported position beside farmer")
                 check();root.CFrame=pose
                 root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero
-                pause(0.15)
+                stationed=true
+                pause(0.25)
             end
             check()
             assert(options.Equip(),"Potion slot is not ready")
             pause(0.1)
-            if accepted()then busy=false;return end
+            if accepted()then busy=false;stationed=false;return end
             check()
             assert(options.Player:GetAttribute("NeedleOwned")==true,"Potion ownership changed")
             assert(farmer.Parent==npcs and(root.Position-farmer:GetPivot().Position).Magnitude<=14,"Farmer moved outside hand-in range")
@@ -1318,7 +1368,8 @@ local function createPotionHandIn(options)
             status("Waiting for farmer to accept potion")
         end)
         if not ok then
-            pending=nil;busy=false;character=nil;tripRoot=nil
+            pending=nil;busy=false
+            if not stationed then character=nil;tripRoot=nil end
             retryAt=options.Now()+2
             if alive then status("Potion hand-in paused: "..tostring(err))end
         end
@@ -2354,6 +2405,7 @@ end
         sundialController=createSundialAutomation(sundialOptions)
         local potionOptions=table.clone(interactionOptions)
         potionOptions.Player=LocalPlayer
+        potionOptions.Approach=createFarmerApproach({World=Workspace,Player=LocalPlayer})
         potionOptions.Click=createFarmerClick({
             World=Workspace,Player=LocalPlayer,Input=VirtualInputManager,Wait=task.wait,
             FrameWait=function()RunService.RenderStepped:Wait()end,
