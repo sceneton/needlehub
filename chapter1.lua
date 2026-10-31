@@ -3879,6 +3879,8 @@ end
 end
 
 do
+    -- Keep settings/configuration temporaries out of the module register budget.
+    (function()
     Header(SettingsTab, "Menu")
     SettingsTab:Keybind({
         Title = "Menu keybind", Value = "RightControl",
@@ -4217,6 +4219,7 @@ do
         restoringStartupAutoFarm = false
         if sharedAFKAtChapterEntry ~= nil then saveAutoFarmPreference(sharedAFKAtChapterEntry) end
     end
+    end)()
 end
 
 task.spawn(function()
