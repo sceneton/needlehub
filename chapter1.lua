@@ -2979,6 +2979,8 @@ do
     end)()
 end
 
+-- Build menu controls in their own register scope; retain the startup-selected tab.
+local CollectingTab = (function()
 local MainTab = Window:Tab({ Title = "Overview & Settings", Icon = "house" })
 local FarmingSection = Window:Section({ Title = "Farming", Icon = "wheat", Opened = true })
 local CollectingTab = FarmingSection:Tab({ Title = "Collecting", Icon = "wheat" })
@@ -4221,6 +4223,8 @@ do
     end
     end)()
 end
+return CollectingTab
+end)()
 
 task.spawn(function()
     while not Unloaded do
@@ -5760,6 +5764,9 @@ task.spawn(function()
 end)
 
 do
+-- Isolate remaining startup/background locals from the module register budget.
+(function()
+do
     local virtualUser = game:GetService("VirtualUser")
     local beyyAntiAfkConnection = LocalPlayer.Idled:Connect(function()
         if Unloaded then return end
@@ -5873,3 +5880,6 @@ task.spawn(function()
         end
     end
 end)
+
+end)()
+end
