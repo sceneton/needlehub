@@ -1,4 +1,5 @@
--- Beyy Chapter 2 Papers Only v1: native NumberPuzzle only, then haypile return.
+-- Beyy Chapter 2 Papers Only v2: start on replicated puzzle readiness; verified haypile return.
+-- Compatible with the Beyy Chapter 2 Papers Only v1 factory interface.
 -- Returns a factory; the hub supplies movement, remote discovery and status callbacks.
 return function(options)
     local api={Running=false,Phase="Ready",Code=nil,Requests=0,Returned=false}
@@ -72,25 +73,30 @@ return function(options)
                         observeCode(code)
                     end)
                 end
-                requestState()
-                if not waitFor(function()return type(state.NumberPuzzle)=="table"end,3)then
-                    status("Waiting for intro before retrying puzzle state")
-                    assert(waitFor(options.IntroFinished,40),"Intro did not finish")
-                    requestState()
-                    assert(waitFor(function()return type(state.NumberPuzzle)=="table"end,3),"No server puzzle state")
-                end
-                if numberState().completed~=true then
-                    status("Waiting for intro to finish")
-                    assert(waitFor(options.IntroFinished,40),"Intro did not finish")
-                    options.Wait(0.4);guard() -- Let the native intro handoff settle before moving.
-                    local posters=context.Posters:GetChildren()
-                    local papers={}
-                    for _,poster in ipairs(posters)do
-                        local index=poster:GetAttribute("PosterIndex")
-                        if poster:IsA("BasePart")and type(index)=="number"then
-                            papers[#papers+1]={Part=poster,Index=index}
-                        end
+                status("Waiting for server Number Puzzle state")
+                local nextStateRequest=0
+                assert(waitFor(function()
+                    if type(state.NumberPuzzle)=="table"then return true end
+                    if options.Now()>=nextStateRequest then
+                        nextStateRequest=options.Now()+0.5
+                        requestState()
                     end
+                    return type(state.NumberPuzzle)=="table"
+                end,40),"No server puzzle state")
+                if numberState().completed~=true then
+                    local papers={}
+                    status("Waiting for paper targets")
+                    assert(waitFor(function()
+                        if valid(api.Code)or numberState().completed==true then return true end
+                        table.clear(papers)
+                        for _,poster in ipairs(context.Posters:GetChildren())do
+                            local index=poster:GetAttribute("PosterIndex")
+                            if poster:IsA("BasePart")and type(index)=="number"then
+                                papers[#papers+1]={Part=poster,Index=index}
+                            end
+                        end
+                        return #papers>0
+                    end,10),"Paper targets did not replicate")
                     table.sort(papers,function(a,b)return a.Index<b.Index end)
                     for _,paper in ipairs(papers)do
                         if valid(api.Code)or numberState().completed==true then break end
