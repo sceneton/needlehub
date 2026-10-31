@@ -1000,6 +1000,172 @@ local function createTabletPickup(options)
 end
 
 
+local function createSundialAutomation(options)
+    local api={}
+    local alive,busy=true,false
+    local home,tripCharacter,tripRoot,startedAt
+    local nextTurnAt,retryAt,alignedAt=0,0,nil
+    local failures,requests=0,0
+    local lastStatus
+    local function status(text)
+        if text~=lastStatus then lastStatus=text;options.Status(text)end
+    end
+    local function clearTrip()
+        home=nil;tripCharacter=nil;tripRoot=nil;startedAt=nil;requests=0;alignedAt=nil
+    end
+    local function allowed()
+        if not alive or not options.Enabled()or options.Blocked()then return false end
+        local char,root,hum=options.Character()
+        return char and root and hum and hum.Health>0 and not root.Anchored
+            and(not tripCharacter or(char==tripCharacter and root==tripRoot))
+    end
+    local function check()assert(allowed(),"Sundial paused")end
+    local function pause(seconds)
+        local untilAt=options.Now()+seconds
+        repeat options.Wait(0.05);check()until options.Now()>=untilAt
+    end
+    local function position(prompt)
+        local parent=prompt.Parent
+        if parent and parent:IsA("Attachment")then return parent.WorldPosition end
+        if parent and parent:IsA("BasePart")then return parent.Position end
+        return nil
+    end
+    local function move(pose)
+        check();tripRoot.CFrame=pose
+        tripRoot.AssemblyLinearVelocity=Vector3.zero;tripRoot.AssemblyAngularVelocity=Vector3.zero
+    end
+    local function returnHome()
+        if not home then return end
+        for attempt=1,3 do
+            check()
+            if(tripRoot.Position-home.Position).Magnitude>0.75 then move(home)end
+            local retained=true
+            for i=1,3 do pause(0.1);if(tripRoot.Position-home.Position).Magnitude>3 then retained=false;break end end
+            if retained then clearTrip();return end
+        end
+        error("Game moved the character back during sundial return")
+    end
+    local function plan(sundial)
+        local rings=sundial:FindFirstChild("Rings")
+        local pedestals=sundial:FindFirstChild("Pedestals")
+        local tablets=options.World:FindFirstChild("RelicTablets")
+        if not rings or not pedestals then return nil,"Waiting for sundial rings and cranks"end
+        local list={}
+        for _,ring in ipairs(rings:GetChildren())do
+            local index=tonumber(ring.Name:match("^Ring(%d+)$"))
+            if index then list[#list+1]={Ring=ring,Index=index}end
+        end
+        table.sort(list,function(a,b)return a.Index<b.Index end)
+        local total=tonumber(sundial:GetAttribute("TabletsTotal"))or 3
+        if #list~=total then return nil,"Waiting for all sundial rings"end
+        local first
+        for _,entry in ipairs(list)do
+            local ring,index=entry.Ring,entry.Index
+            local want=ring:GetAttribute("Want")
+            if type(want)~="string"and tablets then
+                for _,tablet in ipairs(tablets:GetChildren())do
+                    if tablet:GetAttribute("Ring")==index and tablet:GetAttribute("Placed")==true then want=tablet:GetAttribute("Glyph");break end
+                end
+            end
+            local glyphs,maxIndex={},0
+            for _,tile in ipairs(ring:GetChildren())do
+                local at,glyph=tile:GetAttribute("Tile"),tile:GetAttribute("Glyph")
+                if type(at)=="number"and at>=1 and at<=128 and at%1==0 and type(glyph)=="string"then
+                    if glyphs[at]and glyphs[at]~=glyph then return nil,"Waiting for consistent ring symbols"end
+                    glyphs[at]=glyph;maxIndex=math.max(maxIndex,at)
+                end
+            end
+            local desired
+            for i=1,maxIndex do
+                if not glyphs[i]then return nil,"Waiting for complete ring symbols"end
+                if glyphs[i]==want then desired=i-1 end
+            end
+            local steps=tonumber(ring:GetAttribute("Steps"))
+            if not desired or not steps then return nil,"Waiting for ring targets and steps"end
+            local remaining=(desired-steps%maxIndex)%maxIndex
+            if remaining>0 and not first then
+                local pedestal
+                for _,p in ipairs(pedestals:GetChildren())do if p:GetAttribute("Ring")==index then pedestal=p;break end end
+                local prompt=pedestal and pedestal:FindFirstChildWhichIsA("ProximityPrompt",true)
+                if not prompt or not prompt.Enabled or not position(prompt)then return nil,"Waiting for ring "..index.." crank"end
+                first={Ring=ring,Index=index,Want=want,Prompt=prompt,Remaining=remaining}
+            end
+        end
+        return first,"All rings aligned; waiting for server confirmation"
+    end
+    function api.Stop()alive=false;busy=false;clearTrip()end
+    function api.IsBusy()return busy or home~=nil end
+    function api.Tick()
+        if not alive then return end
+        if not options.Enabled()then clearTrip();failures=0;retryAt=0;nextTurnAt=0;status("Disabled");return end
+        local char,root,hum=options.Character()
+        if tripCharacter and(char~=tripCharacter or root~=tripRoot)then clearTrip()end
+        if not allowed()then status("Paused during menu, cutscene or boss fight");return end
+        if options.Now()<retryAt or options.Now()<nextTurnAt then return end
+        local sundial=options.World:FindFirstChild("Sundial")
+        if not sundial then status("Waiting for sundial");return end
+        local solved=sundial:GetAttribute("Solved")==true
+        if solved and not home then status("Sundial solved");return end
+        if not solved and(tonumber(sundial:GetAttribute("TabletsPlaced"))or 0)<(tonumber(sundial:GetAttribute("TabletsTotal"))or 3)then
+            status("Waiting for all tablets to be placed");return
+        end
+        local target,message
+        if not solved then target,message=plan(sundial)end
+        if not solved and not target then
+            status(message)
+            if message~="All rings aligned; waiting for server confirmation"then return end
+            alignedAt=alignedAt or options.Now()
+            if options.Now()-alignedAt<3 then return end
+            if home then
+                busy=true
+                pcall(returnHome)
+                busy=false
+                retryAt=options.Now()+5
+            end
+            status("Rings match their targets; server has not marked the sundial solved")
+            return
+        end
+        alignedAt=nil;busy=true
+        local ok,err=pcall(function()
+            options.PauseTools();check()
+            if solved then returnHome();status("Sundial solved; returned to starting position");return end
+            assert(type(options.Trigger)=="function","ProximityPrompt turns are unavailable in this executor")
+            if not home then tripCharacter,tripRoot,home,startedAt=char,root,root.CFrame,options.Now();requests=0 end
+            assert(options.Now()-startedAt<90 and requests<30,"Sundial turn safety limit reached")
+            local prompt=target.Prompt
+            status("Ring "..target.Index..": "..target.Want.." | "..target.Remaining.." turn(s) remaining")
+            if(root.Position-position(prompt)).Magnitude>math.max(1,prompt.MaxActivationDistance-0.5)then
+                local pose=options.Approach(position(prompt),root,hum,sundial,prompt.MaxActivationDistance)
+                assert(pose,"No floor-supported position beside ring "..target.Index)
+                move(pose);pause(0.15)
+            end
+            check()
+            -- Another player may have turned a ring while we moved. Replan before sending.
+            local latest=plan(sundial)
+            if sundial:GetAttribute("Solved")==true or not latest or latest.Ring~=target.Ring then return end
+            assert(prompt.Enabled and(root.Position-position(prompt)).Magnitude<=prompt.MaxActivationDistance,"Crank unavailable or outside range")
+            local before=target.Ring:GetAttribute("Steps")
+            requests+=1;nextTurnAt=options.Now()+0.55
+            options.Trigger(prompt,prompt.HoldDuration+0.05)
+            local untilAt=options.Now()+2
+            repeat
+                check()
+                if target.Ring:GetAttribute("Steps")~=before or sundial:GetAttribute("Solved")==true then failures=0;return end
+                pause(0.05)
+            until options.Now()>=untilAt
+            error("Server did not confirm ring "..target.Index.." turn")
+        end)
+        if not ok and alive then
+            failures+=1;retryAt=options.Now()+(failures<3 and 1 or 5)
+            if allowed()and home then pcall(returnHome)end
+            status("Sundial paused: "..tostring(err))
+        end
+        busy=false
+    end
+    return api
+end
+
+
 local function createVacuumUpgradePriority(state, getConfig, getCash, getLevel, send)
     local pending
     local lastConfirmedAt
@@ -1522,15 +1688,17 @@ end
         Callback = function() pcall(_G.__BEYY_HUB_CLEANUP) end,
     })
 
-    local tabletController
-    local sharedFarmPuzzleBusy = function() return tabletController and tabletController.IsBusy() or false end
+    local tabletController,sundialController
+    local sharedFarmPuzzleBusy = function()
+        return(tabletController and tabletController.IsBusy())or(sundialController and sundialController.IsBusy())or false
+    end
     local sharedFarmDefaults = {
         AutoPickHay=false, AutoCollectDroppedHay=false, AutoCollectGems=false, CollectInterval=0.5,
         AutoSellHay=false, SellThreshold=25, SellOnlyIfFull=false,
         AutoUseTNT=false, AutoUsePitchfork=false, AutoDeployDrone=false,
         TntLightCooldown=0, TntThrowDelay=0.4,
         AutoUseVacuum=false, VacuumHotbarSlot=5, ToolInterval=0.5,
-        AutoPickupTablets=false,
+        AutoPickupTablets=false, AutoSolveSundial=false,
         AutoBuyTools=false, BuyToolsList={"Pitchfork"}, BuyInterval=1,
         UpgBagSize=false, UpgExtraTake=false, UpgGemValue=false, UpgHayValue=false, PermInterval=0.5,
         UpgCapacity=false, UpgHandSpeed=false, UpgHandGrab=false, UpgHandHold=false,
@@ -1648,6 +1816,10 @@ end
     farmToggle(tabletTab,"AutoPickupTablets","Auto Pickup Tablets",
         "Collect revealed tablets using their pickup prompts, then return to your starting position. Close the menu to run.")
     local tabletStatus=tabletTab:Paragraph({Title="Tablet Pickup Status",Desc="Disabled"})
+    tabletTab:Section({Title="Sundial"})
+    farmToggle(tabletTab,"AutoSolveSundial","Auto Solve Sundial",
+        "After all tablets are placed, match each ring to its symbol using the crank prompts, then return. Close the menu to run.")
+    local sundialStatus=tabletTab:Paragraph({Title="Sundial Status",Desc="Disabled"})
     shopTab:Section({ Title="Purchasing" })
     Registry.BuyToolsList = shopTab:Dropdown({
         Title="Buy Tools Selection",
@@ -1968,7 +2140,7 @@ end
         releaseSharedVacuum()
     end)
     do
-        tabletController=createTabletPickup({
+        local interactionOptions={
             World=Workspace,Now=os.clock,Wait=task.wait,
             Character=function()
                 local char=LocalPlayer.Character
@@ -2009,17 +2181,29 @@ end
                 end
                 return best and(CFrame.new(best)*root.CFrame.Rotation)or nil
             end,
-        })
+        }
+        tabletController=createTabletPickup(interactionOptions)
+        local sundialOptions=table.clone(interactionOptions)
+        sundialOptions.Enabled=function()return sharedFarmState.AutoSolveSundial==true end
+        sundialOptions.Status=function(text)if not hubUnloaded then sundialStatus:SetDesc(text)end end
+        sundialController=createSundialAutomation(sundialOptions)
         local previous=_G.__BEYY_HUB_CLEANUP
         _G.__BEYY_HUB_CLEANUP=function()
             tabletController.Stop()
+            sundialController.Stop()
             if previous then pcall(previous)end
         end
         spawnChapterWorker(function()
             while not hubUnloaded do
-                local ok,err=pcall(tabletController.Tick)
-                if not ok and not hubUnloaded then tabletStatus:SetDesc("Tablet worker error: "..tostring(err))end
-                task.wait(sharedFarmState.AutoPickupTablets and 0.25 or 0.5)
+                if not sundialController.IsBusy()then
+                    local ok,err=pcall(tabletController.Tick)
+                    if not ok and not hubUnloaded then tabletStatus:SetDesc("Tablet worker error: "..tostring(err))end
+                end
+                if not tabletController.IsBusy()then
+                    local ok,err=pcall(sundialController.Tick)
+                    if not ok and not hubUnloaded then sundialStatus:SetDesc("Sundial worker error: "..tostring(err))end
+                end
+                task.wait(sundialController.IsBusy()and 0.05 or(sharedFarmState.AutoPickupTablets or sharedFarmState.AutoSolveSundial)and 0.25 or 0.5)
             end
         end)
     end
@@ -3155,4 +3339,5 @@ end
     end)
     print("[BeyyHub] v103.00 " .. BEYY_CHAPTER .. " module loaded (RightControl to open)")
 end
+
 
