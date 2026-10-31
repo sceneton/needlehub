@@ -1,6 +1,11 @@
 -- beyy v103.00 | Chapter2 module | PlaceId 83445806734780
 local __BEYY_MODULE = "Chapter2"
 local __BEYY_SCRIPT_VERSION = "103.00"
+-- Sceneton Chapter2 revision-aware workers v1
+local __BEYY_CH2_SOURCE_REVISION=...
+if type(__BEYY_CH2_SOURCE_REVISION)~="string"or #__BEYY_CH2_SOURCE_REVISION~=40
+    or not __BEYY_CH2_SOURCE_REVISION:match("^%x+$")then __BEYY_CH2_SOURCE_REVISION=nil end
+local __BEYY_CH2_PAPERS_WANTED=false
 -- Confirmed parallel puzzle queues and native key pickup/turn-in.
 local __BEYY_BOOT_T0 = os.clock()
 if game.PlaceId ~= 83445806734780 then
@@ -25,9 +30,9 @@ local URL="https://raw.githubusercontent.com/BeyyTU/needlehub/main/chapter2-no-l
 local Players=game:GetService("Players")
 local paths={
     {name="CUTSCENE",file="chapter2-cutscene-deferred-invisible-skip-test.lua",
-        base="https://raw.githubusercontent.com/sceneton/needlehub/main/",
+        base="https://raw.githubusercontent.com/sceneton/needlehub/"..(__BEYY_CH2_SOURCE_REVISION or "main").."/",
         marker="Beyy Chapter 2 Indexed Cutscene Visuals v3 PAPERS RETURN",
-        cache="BeyyHub/chapter2_fork_indexed_cutscene_v3_papers.lua"},
+        cache="BeyyHub/chapter2_fork_indexed_cutscene_v3_papers_"..(__BEYY_CH2_SOURCE_REVISION or "branch")..".lua"},
     {name="PUZZLES",file="chapter2-no-levers-puzzles-dual-range-test.lua",
         marker="Beyy Chapter 2 No-Levers Puzzle Worker v32 DUAL RANGE TEST",
         cache="BeyyHub/chapter2_integrated_v33_puzzles_v32.lua"},
@@ -59,7 +64,7 @@ local function fetch(item,allowCache)
     if cancelled() then return nil,"cancelled",nil end
     -- A lobby preflight saves the exact verified component to the executor's
     -- disk when available; Chapter 2 uses it without another network request.
-    if allowCache and type(readfile)=="function" then
+    if allowCache and(not item.base or __BEYY_CH2_SOURCE_REVISION)and type(readfile)=="function" then
         local ok,data=pcall(readfile,item.cache)
         if ok and valid(data,item) then
             local fn,err=compile(data)
@@ -147,17 +152,18 @@ if game.PlaceId~=CHAPTER2 then
 end
 local function launch(item)
     if cancelled() then return false end
-    local fn,source=fetch(item,true)
+    local fn,source,body=fetch(item,true)
     if cancelled() then return false end
     if not fn then
         fail(item.name.." could not start: "..tostring(source))
-        return false
+        return false,item.name.." download/compile: "..tostring(source)
     end
     local ok,err=pcall(fn)
     if not ok then
         fail(item.name.." startup error: "..tostring(err))
-        return false
+        return false,item.name.." startup: "..tostring(err)
     end
+    if body then cache(item,body)end
     log(item.name.." started ("..source..")")
     return true
 end
@@ -268,32 +274,45 @@ function __BEYY_CH2_CUTSCENE:Cleanup()
     local stop=env.__BEYY_CH2_CUTSCENE_ONLY_STOP
     if type(stop)=="function" then pcall(stop,"BeyyHub cutscene bypass disabled") end
 end
+function __BEYY_CH2_CUTSCENE:Changed()
+    if self.OnState then pcall(self.OnState)end
+end
 function __BEYY_CH2_CUTSCENE:Set(enabled,permanent)
     if not enabled then
         self.Disabled=self.Disabled or permanent==true
         self.Wanted=false;self.Started=false;self.Generation+=1
-        self:Cleanup()
+        self.Attempts=0;self.LastError=nil
+        self:Cleanup();self:Changed()
         return true
     end
     if self.Disabled then return false end
     self.Wanted=true
-    if self.Started or self.Loading then return true end
+    if self.Started or self.Loading then self:Changed();return true end
     self.Generation+=1
     local generation=self.Generation
     local function cancelled()
         return generation~=self.Generation or not self.Wanted or self.Disabled
     end
-    self.Started=true;self.Loading=true
+    self.Attempts=(self.Attempts or 0)+1
+    self.Started=true;self.Loading=true;self:Changed()
     task.spawn(function()
-        local ok,result=pcall(__BEYY_CH2_NO_LEVERS_RUN,cancelled,true)
+        local ok,result,detail=pcall(__BEYY_CH2_NO_LEVERS_RUN,cancelled,true)
         self.Loading=false
-        if cancelled() then
+        if cancelled()then
             self:Cleanup()
-            if self.Wanted and not self.Disabled then self:Set(true) end
+            if self.Wanted and not self.Disabled then self:Set(true)end
         elseif not ok or result~=true then
-            warn("[BeyyHub Chapter2] Cutscene controller failed: "..tostring(result))
-            self:Set(false)
-            if self.OnFailure then self.OnFailure() end
+            self.Started=false
+            self.LastError=tostring(not ok and result or detail or "Module startup did not complete"):sub(1,600)
+            self:Cleanup();self:Changed()
+            warn("[BeyyHub Chapter2] Cutscene startup failed: "..self.LastError)
+            if self.OnFailure then pcall(self.OnFailure,self.LastError)end
+            if self.Attempts<3 then
+                task.wait(self.Attempts)
+                if not cancelled()then self:Set(true)end
+            end
+        else
+            self.Attempts=0;self.LastError=nil;self:Changed()
         end
     end)
     return true
@@ -452,15 +471,16 @@ _G.__BEYY_HUB_LOADED = true
 do
     local config=__beyyConfigDecode(__beyyInitialConfig)
     local elements=config and(config.__elements or config)
-    local function enabled(key)
+    local function enabled(key,default)
         local entry
         if type(elements)=="table" then entry=elements[key] end
         if type(entry)=="table" and entry.__type=="Toggle" and type(entry.value)=="boolean" then return entry.value end
         if type(entry)=="boolean" then return entry end
-        return true
+        return default~=false
     end
     if enabled("CutsceneBypass") then __BEYY_CH2_CUTSCENE:Set(true) end
-    if enabled("Chapter2AutoPuzzles") then __BEYY_CH2_NO_LEVERS_START() end
+    __BEYY_CH2_PAPERS_WANTED=enabled("Chapter2PapersOnly",false)
+    if not __BEYY_CH2_PAPERS_WANTED and enabled("Chapter2AutoPuzzles") then __BEYY_CH2_NO_LEVERS_START() end
 end
 
 local Players = game:GetService("Players")
@@ -2375,7 +2395,7 @@ do
         sharedFarmPuzzleBusy = function()return __BEYY_CH2_NO_LEVERS_SOLVING()or paperOnlyControl.Busy()end
         keyPuzzleCameraBusy = sharedFarmPuzzleBusy
         local puzzleTab = hubWindow:Tab({ Title = "Puzzles", Icon = "puzzle" })
-        puzzleTab:Section({ Title = "Chapter 2 Integrated v33" })
+        puzzleTab:Section({ Title = "Chapter 2 | Papers & Code" })
         puzzleTab:Paragraph({
             Title = "Picture / Color / Number puzzles",
             Desc = "Solve the three puzzles without levers. Keep your location after completion; key pickup and hand-in remain available.",
@@ -2406,14 +2426,20 @@ do
                 if ok and type(value)=="table"then env=value end
             end
             local runner,loading,generation=nil,false,0
+            local stopping=false
             local movementOwner={}
             local status=puzzleTab:Paragraph({Title="Papers & Code Status",Desc="Ready"})
             local function describe(message)if not hubUnloaded then status:SetDesc(message)end end
             paperOnlyControl.Stop=function()
+                if stopping then return end
+                stopping=true;__BEYY_CH2_PAPERS_WANTED=false
                 generation+=1;loading=false
                 if runner then runner.Stop();runner=nil end
                 local marker=env.__BEYY_CH2_INTENTIONAL_MOVE
                 if marker and marker.Owner==movementOwner then env.__BEYY_CH2_INTENTIONAL_MOVE=nil end
+                local toggle=Registry.Chapter2PapersOnly
+                if toggle and toggle.Value then toggle:Set(false)end
+                stopping=false
             end
             paperOnlyControl.Busy=function()return loading or(runner and runner.Running)or false end
             local previousPaperCleanup=_G.__BEYY_HUB_CLEANUP
@@ -2436,7 +2462,7 @@ do
                             task.wait(0.05)
                         end
                         if not current()then return end
-                        local body=game:HttpGet("https://raw.githubusercontent.com/sceneton/needlehub/main/chapter2-papers-only.lua?refresh="..tostring(os.time()))
+                        local body=game:HttpGet("https://raw.githubusercontent.com/sceneton/needlehub/"..(__BEYY_CH2_SOURCE_REVISION or "main").."/chapter2-papers-only.lua?refresh="..tostring(os.time()))
                         if not current()then return end
                         assert(type(body)=="string"and body:find("Beyy Chapter 2 Papers Only v1",1,true),"Papers worker download is invalid")
                         local compiled,compileError=loadstring(body)
@@ -2575,10 +2601,20 @@ do
                     end
                 end)
             end
-            puzzleTab:Button({Title="Collect Papers & Enter Code",
-                Desc="Collect only Number Puzzle papers, submit the code, then return to the haypile. Stops Auto Solve Puzzles.",
-                Callback=startPapers})
-            puzzleTab:Button({Title="Stop Papers & Code",Callback=function()paperOnlyControl.Stop();describe("Stopped")end})
+            Registry.Chapter2PapersOnly=puzzleTab:Toggle({Title="Collect Papers & Enter Code",
+                Value=__BEYY_CH2_PAPERS_WANTED,
+                Desc="Collect Number Puzzle papers, submit the code and return to the haypile. Save to config to run next round; exclusive with Auto Solve Puzzles.",
+                Callback=function(enabled)
+                    if hubUnloaded then return end
+                    __BEYY_CH2_PAPERS_WANTED=enabled==true
+                    if enabled then startPapers()
+                    else paperOnlyControl.Stop();describe("Off")end
+                end})
+            if __BEYY_CH2_PAPERS_WANTED then
+                task.defer(function()
+                    if not hubUnloaded and __BEYY_CH2_PAPERS_WANTED then startPapers()end
+                end)
+            end
         end)()
 
     do
@@ -3413,6 +3449,7 @@ _G.__BEYY_HUB_CLEANUP = function()
 end
 
     overview:Section({ Title = "Cutscenes" })
+    local bypassStartupStatus=overview:Paragraph({Title="Cutscene Bypass Status",Desc="Starting"})
     Registry.CutsceneBypass = overview:Toggle({
         Title = "Unskippable Cutscene Bypass", Value = __BEYY_CH2_CUTSCENE.Wanted,
         Desc = "Hide the opening black screen, handle native intro Skip and bypass non-final cinematics. Independent of Auto Solve Puzzles; final endings stay protected.",
@@ -3420,10 +3457,20 @@ end
             if not hubUnloaded then __BEYY_CH2_CUTSCENE:Set(enabled) end
         end,
     })
-    __BEYY_CH2_CUTSCENE.OnFailure=function()
-        local toggle=Registry.CutsceneBypass
-        if not hubUnloaded and toggle and toggle.Value then toggle:Set(false) end
+    __BEYY_CH2_CUTSCENE.OnState=function()
+        if hubUnloaded then return end
+        local state=__BEYY_CH2_CUTSCENE
+        local text
+        if not state.Wanted then text="Off"
+        elseif state.Loading then text="Starting cutscene worker"
+        elseif state.Started then text="Running"
+        elseif state.LastError then
+            text=(state.Attempts<3 and "Enabled; retrying startup: "or "Enabled; startup failed. Toggle off/on to retry: ")..state.LastError
+        else text="Enabled; waiting to start"end
+        bypassStartupStatus:SetDesc(text)
     end
+    __BEYY_CH2_CUTSCENE.OnFailure=function()__BEYY_CH2_CUTSCENE:Changed()end
+    __BEYY_CH2_CUTSCENE:Changed()
 
     -- Ending protection changes controller activity, never the user's saved toggle.
     autoCutsceneEnableAfterLevers = function() end
@@ -3517,8 +3564,12 @@ end
             local data = __beyyConfigDecode(raw)
             if not data then return false, "No readable config: " .. name end
             local applied = 0
+            local elements=data.__elements or data
+            local papers=elements.Chapter2PapersOnly
+            local papersSelected=type(papers)=="table"and papers.__type=="Toggle"and papers.value==true
             for key, el in pairs(self.Elements) do
-                local entry = (data.__elements or data)[key]
+                local entry = elements[key]
+                if papersSelected and key=="Chapter2AutoPuzzles"then entry={__type="Toggle",value=false}end
                 if type(entry) == "table" and entry.__type == el.__type then
                     local ok, err = pcall(function()
                         if el.__type == "Dropdown" then el:Select(entry.value)
