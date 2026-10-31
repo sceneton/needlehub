@@ -1166,6 +1166,96 @@ local function createSundialAutomation(options)
 end
 
 
+local function createPotionHandIn(options)
+    local api={}
+    local alive,busy=true,false
+    local pending,character,tripRoot
+    local attempts,retryAt=0,0
+    local lastStatus
+    local function status(text)
+        if text~=lastStatus then lastStatus=text;options.Status(text)end
+    end
+    local function accepted()
+        local folder=options.Shared()
+        return folder and folder:GetAttribute("PotionHandedInBy")~=nil
+    end
+    local function allowed()
+        if not alive or not options.Enabled()or options.Blocked()then return false end
+        local char,root,hum=options.Character()
+        return char and root and hum and hum.Health>0 and not root.Anchored
+            and(not character or(char==character and root==tripRoot))
+    end
+    local function check()assert(allowed(),"Potion hand-in paused")end
+    local function pause(seconds)
+        local untilAt=options.Now()+seconds
+        repeat options.Wait(0.05);check()until options.Now()>=untilAt
+    end
+    function api.Stop()alive=false;busy=false;pending=nil;character=nil;tripRoot=nil end
+    function api.IsBusy()return busy end
+    function api.Tick()
+        if not alive then return end
+        if not options.Enabled()then
+            busy=false;pending=nil;character=nil;tripRoot=nil;attempts=0;retryAt=0;status("Disabled");return
+        end
+        -- Acknowledgement can arrive together with a cutscene/input lock.
+        -- Observe it before checking locks; do not move or send again afterwards.
+        if accepted()then pending=nil;busy=false;status("Potion accepted by farmer; boss sequence started");return end
+        local char,root,hum=options.Character()
+        if character and(char~=character or root~=tripRoot)then
+            character=nil;tripRoot=nil;pending=nil;busy=false;attempts=0
+        end
+        if pending then
+            if options.Now()<pending.Until then status("Waiting for farmer to accept potion");return end
+            pending=nil;busy=false
+            retryAt=options.Now()+(attempts<3 and 0.25 or 5)
+            if attempts>=3 then attempts=0 end
+            status("Hand-in not confirmed; waiting before retry");return
+        end
+        if options.Now()<retryAt then return end
+        if not allowed()then status("Paused during menu, cutscene or boss fight");return end
+        if options.Player:GetAttribute("NeedleOwned")~=true then status("Waiting to receive the sundial potion");return end
+        local sundial=options.World:FindFirstChild("Sundial")
+        if not sundial or sundial:GetAttribute("Solved")~=true then status("Waiting for sundial completion");return end
+        local npcs=options.World:FindFirstChild("NPC")
+        local farmer=npcs and npcs:FindFirstChild("Farmer_NPC")
+        local folder=options.Shared()
+        local remote=folder and folder:FindFirstChild("NeedleHandIn")
+        if not farmer or not remote or not remote:IsA("RemoteEvent")then status("Waiting for farmer and hand-in remote");return end
+        busy=true;character,tripRoot=char,root
+        local ok,err=pcall(function()
+            options.PauseTools();check()
+            local target=farmer:GetPivot().Position
+            status("Bringing potion to farmer")
+            if(root.Position-target).Magnitude>12 then
+                local pose=options.Approach(target,root,hum,farmer,12)
+                assert(pose,"No floor-supported position beside farmer")
+                check();root.CFrame=pose
+                root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero
+                pause(0.15)
+            end
+            check()
+            assert(options.Equip(),"Potion slot is not ready")
+            pause(0.1)
+            if accepted()then busy=false;return end
+            check()
+            assert(options.Player:GetAttribute("NeedleOwned")==true,"Potion ownership changed")
+            assert(farmer.Parent==npcs and(root.Position-farmer:GetPivot().Position).Magnitude<=14,"Farmer moved outside hand-in range")
+            assert(remote.Parent==options.Shared(),"Hand-in remote changed")
+            attempts+=1
+            pending={Until=options.Now()+2}
+            remote:FireServer()
+            status("Waiting for farmer to accept potion")
+        end)
+        if not ok then
+            pending=nil;busy=false;character=nil;tripRoot=nil
+            retryAt=options.Now()+2
+            if alive then status("Potion hand-in paused: "..tostring(err))end
+        end
+    end
+    return api
+end
+
+
 local function createVacuumUpgradePriority(state, getConfig, getCash, getLevel, send)
     local pending
     local lastConfirmedAt
@@ -1688,9 +1778,9 @@ end
         Callback = function() pcall(_G.__BEYY_HUB_CLEANUP) end,
     })
 
-    local tabletController,sundialController
+    local tabletController,sundialController,potionController
     local sharedFarmPuzzleBusy = function()
-        return(tabletController and tabletController.IsBusy())or(sundialController and sundialController.IsBusy())or false
+        return(tabletController and tabletController.IsBusy())or(sundialController and sundialController.IsBusy())or(potionController and potionController.IsBusy())or false
     end
     local sharedFarmDefaults = {
         AutoPickHay=false, AutoCollectDroppedHay=false, AutoCollectGems=false, CollectInterval=0.5,
@@ -1698,7 +1788,7 @@ end
         AutoUseTNT=false, AutoUsePitchfork=false, AutoDeployDrone=false,
         TntLightCooldown=0, TntThrowDelay=0.4,
         AutoUseVacuum=false, VacuumHotbarSlot=5, ToolInterval=0.5,
-        AutoPickupTablets=false, AutoSolveSundial=false,
+        AutoPickupTablets=false, AutoSolveSundial=false, AutoBringPotion=false,
         AutoBuyTools=false, BuyToolsList={"Pitchfork"}, BuyInterval=1,
         UpgBagSize=false, UpgExtraTake=false, UpgGemValue=false, UpgHayValue=false, PermInterval=0.5,
         UpgCapacity=false, UpgHandSpeed=false, UpgHandGrab=false, UpgHandHold=false,
@@ -1820,6 +1910,10 @@ end
     farmToggle(tabletTab,"AutoSolveSundial","Auto Solve Sundial",
         "After all tablets are placed, match each ring to its symbol using the crank prompts, then return. Close the menu to run.")
     local sundialStatus=tabletTab:Paragraph({Title="Sundial Status",Desc="Disabled"})
+    tabletTab:Section({Title="Potion"})
+    farmToggle(tabletTab,"AutoBringPotion","Auto Bring Potion to Farmer",
+        "Equip the sundial potion and deliver it to the farmer. This starts the boss fight. Close the menu to run.")
+    local potionStatus=tabletTab:Paragraph({Title="Potion Hand-in Status",Desc="Disabled"})
     shopTab:Section({ Title="Purchasing" })
     Registry.BuyToolsList = shopTab:Dropdown({
         Title="Buy Tools Selection",
@@ -2187,23 +2281,50 @@ end
         sundialOptions.Enabled=function()return sharedFarmState.AutoSolveSundial==true end
         sundialOptions.Status=function(text)if not hubUnloaded then sundialStatus:SetDesc(text)end end
         sundialController=createSundialAutomation(sundialOptions)
+        local potionOptions=table.clone(interactionOptions)
+        potionOptions.Player=LocalPlayer
+        potionOptions.Enabled=function()return sharedFarmState.AutoBringPotion==true end
+        potionOptions.Shared=function()return ReplicatedStorage:FindFirstChild("NeedleHaystack")end
+        potionOptions.Status=function(text)if not hubUnloaded then potionStatus:SetDesc(text)end end
+        local hotbarModule,hotbar
+        potionOptions.Equip=function()
+            local scripts=LocalPlayer:FindFirstChild("PlayerScripts")
+            local module=scripts and scripts:FindFirstChild("HotbarSlots")
+            if not module then return false end
+            if module~=hotbarModule then
+                local ok,value=pcall(require,module)
+                if not ok or type(value)~="table"then return false end
+                hotbarModule,hotbar=module,value
+            end
+            local slot=sharedGameConfig and tonumber(sharedGameConfig.NEEDLE_SLOT_INDEX)or 6
+            if type(hotbar.select)~="function"or type(hotbar.getEquipped)~="function"then return false end
+            hotbar.select(slot)
+            return hotbar.getEquipped()==slot
+        end
+        potionController=createPotionHandIn(potionOptions)
         local previous=_G.__BEYY_HUB_CLEANUP
         _G.__BEYY_HUB_CLEANUP=function()
             tabletController.Stop()
             sundialController.Stop()
+            potionController.Stop()
             if previous then pcall(previous)end
         end
         spawnChapterWorker(function()
             while not hubUnloaded do
-                if not sundialController.IsBusy()then
+                if not sundialController.IsBusy()and not potionController.IsBusy()then
                     local ok,err=pcall(tabletController.Tick)
                     if not ok and not hubUnloaded then tabletStatus:SetDesc("Tablet worker error: "..tostring(err))end
                 end
-                if not tabletController.IsBusy()then
+                if not tabletController.IsBusy()and not potionController.IsBusy()then
                     local ok,err=pcall(sundialController.Tick)
                     if not ok and not hubUnloaded then sundialStatus:SetDesc("Sundial worker error: "..tostring(err))end
                 end
-                task.wait(sundialController.IsBusy()and 0.05 or(sharedFarmState.AutoPickupTablets or sharedFarmState.AutoSolveSundial)and 0.25 or 0.5)
+                if not tabletController.IsBusy()and not sundialController.IsBusy()then
+                    local ok,err=pcall(potionController.Tick)
+                    if not ok and not hubUnloaded then potionStatus:SetDesc("Potion worker error: "..tostring(err))end
+                end
+                task.wait((sundialController.IsBusy()or potionController.IsBusy())and 0.05
+                    or(sharedFarmState.AutoPickupTablets or sharedFarmState.AutoSolveSundial or sharedFarmState.AutoBringPotion)and 0.25 or 0.5)
             end
         end)
     end
