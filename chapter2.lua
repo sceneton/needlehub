@@ -2578,7 +2578,7 @@ do
                                     local spot=floorPoint(point,context.Root,range,false)
                                     assert(spot,"No floor-supported position near paper/keypad")
                                     moveRoot(CFrame.new(spot)*context.Root.CFrame.Rotation)
-                                    task.wait(0.15);checked()
+                                    task.wait(isKeypad and 0.15 or 0.1);checked()
                                 end
                                 assert((context.Root.Position-point).Magnitude<=range,"Server did not retain interaction position")
                             end,
