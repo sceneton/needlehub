@@ -1,10 +1,11 @@
 -- Beyy Chapter 2 Cutscene-Only Standalone v6 INVISIBLE DEFERRED SKIP TEST
+-- Beyy Chapter 2 Indexed Cutscene Visuals v1
 -- Intro: defer native Skip until puzzles finish, visually mask Skip GUI while keeping its native click enabled.
 -- Non-final lever/puzzle cinematics: local camera/input/overlay recovery only.
 -- No puzzle or lever actions, hay teleport, progression remotes, or final-ending bypass.
 local LOBBY=77108422251420
 local CHAPTER2=83445806734780
-local URL="https://raw.githubusercontent.com/BeyyTU/needlehub/main/chapter2-cutscene-deferred-invisible-skip-test.lua"
+local URL="https://raw.githubusercontent.com/sceneton/needlehub/main/chapter2-cutscene-deferred-invisible-skip-test.lua"
 local Players=game:GetService("Players")
 local RunService=game:GetService("RunService")
 local UserInputService=game:GetService("UserInputService")
@@ -92,11 +93,16 @@ local skipMaskApplies=0
 local skipMaskRestoreCount=0
 local skipMaskButtonName="none"
 local skipMaskActive=false
+local skipManualFallback=false
 local introCameraActive=false
 local introCameraFrames=0
 local introCameraReleased=false
 -- Preserve the player's actual pre-Skip view for the non-final camera handoff.
 local introHandoffLook=nil
+local introHandoffDistance=nil
+local introBridgeActive=false
+local introBridgeStartedAt=-math.huge
+local puzzleReleasePrimed=false
 local nonfinalGraceUntil=0
 local lastSceneSignal="none"
 local lastFlagState=nil
@@ -111,6 +117,13 @@ local bypassActive=false
 local bypassCount=0
 local bypassFrames=0
 local inputRestores=0
+local postReleaseCameraGuardUntil=0
+local cameraGuardRecoveries=0
+local cameraGuardPreviousRoot=nil
+local cameraGuardPreviousEye=nil
+local cameraGuardAvatarDistance=0
+local cameraGuardCameraDistance=0
+local cameraGuardLastFix=-math.huge
 local bypassStartedAt=0
 local releaseGraceUntil=0
 local finalProtectedLogged=false
@@ -255,19 +268,34 @@ local function restoreIntroBlack()
         pcall(function()introBlack.Visible=blackOriginal end)
     end
 end
+-- Capture both direction and zoom; the previous handoff silently changed
+-- a 4-stud third-person intro view into the bypass's 0.6-stud first-person default.
+local function captureIntroView()
+    local cam=Workspace.CurrentCamera
+    if not cam then return end
+    introHandoffLook=cam.CFrame.LookVector
+    local char=player and player.Character
+    local root=char and char:FindFirstChild("HumanoidRootPart")
+    if root then
+        local head=char:FindFirstChild("Head")
+        local eye=head and head.Position or (root.Position+Vector3.new(0,1.6,0))
+        local d=(cam.CFrame.Position-eye).Magnitude
+        if d>=0.2 and d<=22 then introHandoffDistance=d end
+    end
+end
 local function clickIntroSkip(button)
     if not alive or not button or not nativeIntroSkip() then return end
     -- Release pre-Skip camera mouse lock before synthetic GUI input.
     if introCameraActive then
         introCameraActive=false
         introCameraReleased=true
-        local cam=Workspace.CurrentCamera
-        if cam then
-            introHandoffLook=cam.CFrame.LookVector
-            cam.CameraType=Enum.CameraType.Custom
-        end
+        captureIntroView()
+        introBridgeActive=true
+        introBridgeStartedAt=os.clock()
+        -- Keep Scriptable camera pointed at the player until the release
+        -- controller takes over; unlock the cursor for the native GUI click.
         pcall(function()UserInputService.MouseBehavior=Enum.MouseBehavior.Default end)
-        emit("CAMERA","Released early camera for native Skip button")
+        emit("CAMERA","Seamless intro camera bridge for native Skip button")
     end
     local centre=button.AbsolutePosition+button.AbsoluteSize/2
     local inset=GuiService:GetGuiInset()
@@ -370,11 +398,14 @@ end
 local function setCutsceneBypassActive(on)
     local was=bypassActive
     bypassActive=on==true
+    if bypassActive then introBridgeActive=false end
     if bypassActive and not was then
         bypassCount+=1
         emit("MAIN CUTSCENE","Playable camera activated")
     elseif was and not bypassActive then
-        emit("MAIN CUTSCENE","Native camera restored")
+        emit("MAIN CUTSCENE",endingProtected() and
+            "Released bypass; native final cinematic camera left untouched"
+            or "Native camera restored")
     end
 end
 
@@ -389,6 +420,9 @@ local function enableCamera()
     return true
 end
 local function restoreNativeCamera()
+    -- When the key/ending begins, native cutscene code owns the camera.
+    -- Changing CameraType back to Custom here can cancel that cutscene.
+    if endingProtected() or finalEndingProtected then return end
     local cam=Workspace.CurrentCamera
     if cam then
         local char=player and player.Character
@@ -408,21 +442,44 @@ local function beginIntroCamera()
 end
 local function finishIntroCamera(reason)
     if not introCameraActive then return end
-    local cam=Workspace.CurrentCamera
-    if cam then introHandoffLook=cam.CFrame.LookVector end
+    captureIntroView()
     introCameraActive=false
     introCameraReleased=true
-    restoreNativeCamera()
+    if reason=="native intro Skip allowed" and not endingProtected() then
+        introBridgeActive=true
+        introBridgeStartedAt=os.clock()
+        -- No intermediate Custom camera: the non-final controller will
+        -- take ownership as soon as the native intro ends.
+        pcall(function()UserInputService.MouseBehavior=Enum.MouseBehavior.Default end)
+        emit("CAMERA","Seamless pre-Skip bridge armed")
+    else
+        introBridgeActive=false
+        restoreNativeCamera()
+    end
     emit("CAMERA","Pre-Skip camera released: "..tostring(reason))
 end
 local function driveCamera()
-    if not alive or not introCameraActive or endingProtected() then return end
+    if not alive or endingProtected() or
+        (not introCameraActive and not introBridgeActive) then return end
+    if introBridgeActive and (bypassActive or os.clock()-introBridgeStartedAt>2.5) then
+        introBridgeActive=false
+        if not bypassActive then
+            local cam=Workspace.CurrentCamera
+            local char=player and player.Character
+            local hum=char and char:FindFirstChildOfClass("Humanoid")
+            if cam then
+                if hum then pcall(function()cam.CameraSubject=hum end) end
+                pcall(function()cam.CameraType=Enum.CameraType.Custom end)
+            end
+        end
+        return
+    end
     local char=player and player.Character
     local root=char and char:FindFirstChild("HumanoidRootPart")
     local cam=Workspace.CurrentCamera
     if not (root and cam) then return end
     local ok,delta=pcall(function()return UserInputService:GetMouseDelta()end)
-    if not UserInputService:GetFocusedTextBox() then
+    if introCameraActive and not UserInputService:GetFocusedTextBox() then
         pcall(function()UserInputService.MouseBehavior=Enum.MouseBehavior.LockCenter end)
         if ok and delta then
             yaw-=delta.X*0.004
@@ -650,10 +707,17 @@ local function launchCutsceneBypass()
         local function kind()
             if shouldYieldCutsceneBypass() then return nil end
             if player:GetAttribute("IntroCutsceneFinished") ~= true then return nil end
-            if introConfirmedAt and os.clock() - introConfirmedAt < INTRO_SETTLE_SECONDS then return nil end
+            local puzzleFolder=ReplicatedStorage:FindFirstChild("Puzzles")
+        local solved=puzzleFolder and (tonumber(puzzleFolder:GetAttribute("SolvedPuzzleCount")) or 0) or 0
+        -- Skip the old intro settling delay once all three puzzles are
+        -- confirmed, so the playable camera can take over immediately.
+        if solved<3 and introConfirmedAt and os.clock()-introConfirmedAt<INTRO_SETTLE_SECONDS then return nil end
             if yieldingToEnding or finalEndingProtected then return nil end
             if player:GetAttribute("Chapter2ReleaseActive") == true
-                or os.clock() < puzzleBypassUntil then return "THREE PUZZLES" end
+                or os.clock() < puzzleBypassUntil
+                or (solved>=3 and player:GetAttribute("CutsceneActive")==true) then
+                return "THREE PUZZLES"
+            end
             if player:GetAttribute("CutsceneActive") == true
                 or os.clock() < leverBypassUntil then return "THREE LEVERS" end
             return nil
@@ -676,6 +740,11 @@ local function launchCutsceneBypass()
             else
                 yaw = lastNormalYaw or math.atan2(planar.X, planar.Z)
                 pitch = clamp(lastNormalPitch or -0.16, -1.20, 1.05)
+            end
+            if introHandoffDistance then
+                lastNormalDistance=introHandoffDistance
+                normalFirstPerson=introHandoffDistance<2.5
+                introHandoffDistance=nil
             end
             cameraFirstPerson = normalFirstPerson or player.CameraMode == Enum.CameraMode.LockFirstPerson
             distance = clamp(lastNormalDistance or 0.6, 0.0, 22)
@@ -750,6 +819,7 @@ local function launchCutsceneBypass()
                 cam.CFrame = result
                 cam.Focus = CFrame.new(focus)
             end)
+            if safe then bypassFrames+=1 end
             inCameraWrite = false
             if not safe and not cameraErrorWarned then
                 cameraErrorWarned = true
@@ -848,6 +918,15 @@ local function launchCutsceneBypass()
             end
         end
 
+        local function keepReleaseVisualsHidden()
+            -- Native release GUI may outlive replicated cutscene flags.
+            -- Hide ONLY non-final cinematic artwork until the key/ending begins.
+            return puzzleReleasePrimed
+                and player:GetAttribute("IntroCutsceneFinished")==true
+                and player:GetAttribute("NeedleOwned")~=true
+                and player:GetAttribute("NeedleRoundComplete")~=true
+                and not finalEndingProtected and not yieldingToEnding
+        end
         local function isFinalOverlay(gui)
             if not gui:IsA("ScreenGui") then return false end
             local name = gui.Name:lower()
@@ -864,35 +943,110 @@ local function launchCutsceneBypass()
             if saved[key] == nil then saved[key] = previous end
             pcall(function() inst[key] = 1 end)
         end
-        local function hideFinalCutsceneVisuals()
-            if not finalVisualsEnabled or not scene then return end
-            -- Full overlay descendant scans are unnecessary every frame.
-            -- The scene poll still catches dynamically added cutscene graphics.
-            local now = os.clock()
-            if now - lastFinalVisualMaskAt < 0.16 then return end
-            lastFinalVisualMaskAt = now
-            local pg = player:FindFirstChildOfClass("PlayerGui")
-            if not pg then return end
-            for _, gui in ipairs(pg:GetChildren()) do
-                if isFinalOverlay(gui) then
-                    for _, el in ipairs(gui:GetDescendants()) do
-                        if el:IsA("GuiObject") then
-                            maskFinalProperty(el, "BackgroundTransparency")
-                            if el:IsA("TextLabel") or el:IsA("TextButton") or el:IsA("TextBox") then
-                                maskFinalProperty(el, "TextTransparency")
-                                maskFinalProperty(el, "TextStrokeTransparency")
-                            end
-                            if el:IsA("ImageLabel") or el:IsA("ImageButton") then
-                                maskFinalProperty(el, "ImageTransparency")
-                            end
-                        elseif el:IsA("UIStroke") then
-                            maskFinalProperty(el, "Transparency")
-                        end
+        -- Discover GUI membership once; refresh eligibility only after names/ancestry change.
+        local function createCutsceneVisualIndex(options)
+            local api={Candidates={}}
+            local current,nodes,connections,dirty=nil,{},{},false
+            local function keys(object)
+                if object:IsA("GuiObject")then
+                    local result={"BackgroundTransparency"}
+                    if object:IsA("CanvasGroup")then result[#result+1]="GroupTransparency"end
+                    if object:IsA("TextLabel")or object:IsA("TextButton")or object:IsA("TextBox")then
+                        result[#result+1]="TextTransparency";result[#result+1]="TextStrokeTransparency"
                     end
+                    if object:IsA("ImageLabel")or object:IsA("ImageButton")then result[#result+1]="ImageTransparency"end
+                    return result
+                elseif object:IsA("UIStroke")then return {"Transparency"}end
+            end
+            local function eligible(object)
+                local node,cinematic=object,false
+                while node and node~=current do
+                    if node.Name=="NeedleEndingUI"then return false end
+                    if node:IsA("ScreenGui")then return options.IsOverlay(node)or cinematic end
+                    if node:IsA("GuiObject")then
+                        local name=node.Name:lower()
+                        cinematic=cinematic or name:find("letterbox",1,true)~=nil or name:find("cinematicbar",1,true)~=nil
+                            or name:find("cutscenebar",1,true)~=nil or name:find("blackbar",1,true)~=nil
+                            or name:find("dialogue",1,true)~=nil or name:find("dialogbox",1,true)~=nil or name:find("subtitle",1,true)~=nil
+                    end
+                    node=node.Parent
+                end
+                return false
+            end
+            local function refresh(object,entry)
+                local matching=entry.Keys and eligible(object)
+                if matching then api.Candidates[object]=entry.Keys
+                elseif api.Candidates[object]then
+                    api.Candidates[object]=nil
+                    options.Restore(object)
+                end
+            end
+            local function remove(object)
+                local entry=nodes[object]
+                if not entry then return end
+                for _,connection in ipairs(entry.Connections)do connection:Disconnect()end
+                nodes[object]=nil;api.Candidates[object]=nil
+                options.Restore(object)
+            end
+            local function add(object)
+                if nodes[object]then return end
+                local entry={Keys=keys(object),Connections={}}
+                nodes[object]=entry
+                if object:IsA("GuiObject")or object:IsA("ScreenGui")then
+                    entry.Connections[#entry.Connections+1]=object:GetPropertyChangedSignal("Name"):Connect(function()dirty=true end)
+                end
+                entry.Connections[#entry.Connections+1]=object.AncestryChanged:Connect(function()
+                    if current and object:IsDescendantOf(current)then dirty=true else remove(object)end
+                end)
+                refresh(object,entry)
+            end
+            function api.Clear()
+                for _,connection in ipairs(connections)do connection:Disconnect()end
+                for _,entry in pairs(nodes)do for _,connection in ipairs(entry.Connections)do connection:Disconnect()end end
+                table.clear(connections);table.clear(nodes);table.clear(api.Candidates)
+                current=nil;dirty=false
+            end
+            function api.Bind(gui)
+                if gui~=current then
+                    api.Clear();current=gui
+                    if gui then
+                        connections[1]=gui.DescendantAdded:Connect(add)
+                        connections[2]=gui.DescendantRemoving:Connect(remove)
+                        for _,object in ipairs(gui:GetDescendants())do add(object)end
+                    end
+                end
+                if dirty then
+                    dirty=false
+                    for object,entry in pairs(nodes)do refresh(object,entry)end
+                end
+            end
+            return api
+        end
+        local function restoreIndexedVisual(object)
+            local props=finalVisualBefore[object]
+            if not props then return end
+            if not endingProtected() and not finalEndingProtected and object.Parent then
+                for key,original in pairs(props)do pcall(function()object[key]=original end)end
+            end
+            finalVisualBefore[object]=nil
+        end
+        local visualIndex=createCutsceneVisualIndex({IsOverlay=isFinalOverlay,Restore=restoreIndexedVisual})
+        local function hideFinalCutsceneVisuals()
+            if not finalVisualsEnabled or(not scene and not keepReleaseVisualsHidden())then return end
+            local pg=player:FindFirstChildOfClass("PlayerGui")
+            visualIndex.Bind(pg)
+            if not pg then return end
+            for object,keys in pairs(visualIndex.Candidates)do
+                if object.Parent then
+                    for _,key in ipairs(keys)do maskFinalProperty(object,key)end
                 end
             end
         end
         local function restoreFinalCutsceneVisuals()
+            visualIndex.Clear()
+            -- Avoid resurrecting old puzzle-release bars/dialogue when the
+            -- needle ending starts. The game's final UI must stay authoritative.
+            if endingProtected() or finalEndingProtected then return end
             for inst, props in pairs(finalVisualBefore) do
                 if inst.Parent then
                     for key, original in pairs(props) do
@@ -1019,6 +1173,7 @@ local function launchCutsceneBypass()
             if player:GetAttribute("NeedleInputLocked") == true then
                 pcall(function() player:SetAttribute("NeedleInputLocked", nil) end)
             end
+            inputRestores+=1
         end
         local function alignCharacterFacing()
             if not alive or not enabled or not active or not faceCameraEnabled then return end
@@ -1059,11 +1214,15 @@ local function launchCutsceneBypass()
         end
         local function restoreCamera()
             restoreHeadTransparency()
+            local endingNow=endingProtected() or finalEndingProtected
             local cam = camera()
-            if cam then
+            if cam and not endingNow then
                 local hum = humanoid()
                 if hum then pcall(function() cam.CameraSubject = hum end) end
                 pcall(function() cam.CameraType = Enum.CameraType.Custom end)
+            elseif endingNow then
+                emit("FINAL","Handoff without camera reset; final cinematic owns CameraType="..
+                    tostring(cam and cam.CameraType))
             end
             local hum = humanoid()
             if hum and lastSavedRotate ~= nil then
@@ -1072,7 +1231,9 @@ local function launchCutsceneBypass()
             local ctrl = getControls()
             if ctrl then pcall(function() ctrl:Enable() end) end
             if originalMouseBehavior then
-                pcall(function() UserInputService.MouseBehavior = originalMouseBehavior end)
+                if not endingNow then
+                    pcall(function() UserInputService.MouseBehavior = originalMouseBehavior end)
+                end
                 originalMouseBehavior = nil
             end
         end
@@ -1093,6 +1254,19 @@ local function launchCutsceneBypass()
             active = false
             restoreCamera()
             setCutsceneBypassActive(false)
+            -- The game's client camera can be left Scriptable after native
+            -- release flags go false. Watch the *actual camera* for a short
+            -- window and only intervene when it stops following the avatar.
+            if puzzleReleasePrimed and not endingProtected()
+                and player:GetAttribute("Chapter2ReleaseActive")~=true
+                and player:GetAttribute("CutsceneActive")~=true then
+                postReleaseCameraGuardUntil=os.clock()+9
+                cameraGuardPreviousRoot=nil
+                cameraGuardPreviousEye=nil
+                cameraGuardAvatarDistance=0
+                cameraGuardCameraDistance=0
+                emit("CAMERA","Release ended: post-cinematic camera ownership watchdog armed (9s)")
+            end
             log("ROBLOX CAMERA RETURNED: " .. tostring(reason))
         end
         local function updateScene()
@@ -1136,7 +1310,7 @@ local function launchCutsceneBypass()
                 end
             elseif scene then
                 log("CUTSCENE FLAG CLEARED: " .. scene .. " — restoring Roblox camera in " .. RECOVERY_GRACE_SECONDS .. "s")
-                restoreFinalCutsceneVisuals()
+                if not keepReleaseVisualsHidden() then restoreFinalCutsceneVisuals() end
                 unwatchLeverCamera()
                 scene = nil
                 recoveryEnd = now + RECOVERY_GRACE_SECONDS
@@ -1144,14 +1318,22 @@ local function launchCutsceneBypass()
                     if alive then updateScene() end
                 end)
             end
-            local shouldKeep = enabled and not yieldingToEnding and (current ~= nil or now < recoveryEnd)
+            -- The 0.75s recovery grace may outlive the release and overlap
+            -- the native final cutscene. Never run input/HUD/camera overrides
+            -- even for one extra frame once the ending is protected.
+            local shouldKeep = enabled and not endingProtected() and not finalEndingProtected
+                and not yieldingToEnding and (current ~= nil or now < recoveryEnd)
             if shouldKeep then
                 if not active then enablePlayableCamera("recovery / F7") end
                 restoreInputs()
                 showGameplayHud()
                 hideFinalCutsceneVisuals()
             else
-                restoreFinalCutsceneVisuals()
+                if keepReleaseVisualsHidden() then
+                    hideFinalCutsceneVisuals()
+                else
+                    restoreFinalCutsceneVisuals()
+                end
                 restoreGameplayHud()
                 if active then disablePlayableCamera("recovered / bypass disabled") end
             end
@@ -1277,6 +1459,60 @@ local function launchCutsceneBypass()
                 lastRenderTime = os.clock()
             end
         end)
+        -- Defensive camera recovery after the native puzzle release. Do
+        -- not force a new camera during puzzle work or the final needle ending.
+        local lastGuardSample=-math.huge
+        hook(RunService.Heartbeat:Connect(function()
+            local now=os.clock()
+            if now>=postReleaseCameraGuardUntil or now-lastGuardSample<0.20 then return end
+            lastGuardSample=now
+            if not alive or active or introCameraActive or introBridgeActive
+                or endingProtected() or finalEndingProtected
+                or player:GetAttribute("Chapter2ReleaseActive")==true
+                or player:GetAttribute("CutsceneActive")==true then
+                if endingProtected() or finalEndingProtected then
+                    postReleaseCameraGuardUntil=0
+                end
+                return
+            end
+            local cam,rt,hum=camera(),root(),humanoid()
+            if not cam or not rt or not hum then return end
+            if cameraGuardPreviousRoot and cameraGuardPreviousEye then
+                cameraGuardAvatarDistance+=(rt.Position-cameraGuardPreviousRoot).Magnitude
+                cameraGuardCameraDistance+=(cam.CFrame.Position-cameraGuardPreviousEye).Magnitude
+            end
+            cameraGuardPreviousRoot=rt.Position
+            cameraGuardPreviousEye=cam.CFrame.Position
+            local scripted=cam.CameraType~=Enum.CameraType.Custom
+            local frozen=(cameraGuardAvatarDistance>=14 and cameraGuardCameraDistance<1.4)
+            if (scripted or frozen) and now-cameraGuardLastFix>1.2 then
+                cameraGuardLastFix=now
+                local oldType=tostring(cam.CameraType)
+                local ok,err=pcall(function()
+                    cam.CameraSubject=hum
+                    if cam.CameraType==Enum.CameraType.Custom then
+                        cam.CameraType=Enum.CameraType.Scriptable
+                    end
+                    cam.CameraType=Enum.CameraType.Custom
+                end)
+                if ok then
+                    cameraGuardRecoveries+=1
+                    emit("CAMERA",string.format(
+                        "RECOVERED camera after release #%d oldType=%s frozen=%s avatarTravel=%.1f cameraTravel=%.1f",
+                        cameraGuardRecoveries,oldType,tostring(frozen),
+                        cameraGuardAvatarDistance,cameraGuardCameraDistance))
+                else
+                    emit("CAMERA","Post-release recovery error: "..tostring(err))
+                end
+                cameraGuardAvatarDistance=0
+                cameraGuardCameraDistance=0
+                cameraGuardPreviousRoot=nil
+                cameraGuardPreviousEye=nil
+            elseif cameraGuardAvatarDistance>=14 then
+                cameraGuardAvatarDistance=0
+                cameraGuardCameraDistance=0
+            end
+        end))
         local simulationSignal = RunService.PreSimulation or RunService.Heartbeat
         hook(simulationSignal:Connect(function()
             if alive and enabled and active and not yieldingToEnding and not shouldYieldCutsceneBypass() then
@@ -1357,7 +1593,9 @@ local function report()
         "Blackout hidden: "..tostring(introBlackHidden),
         "Non-final bypass activations: "..tostring(bypassCount),
         "Non-final camera frames: "..tostring(bypassFrames),
-        "Movement restores: "..tostring(inputRestores),
+        "Movement restore passes: "..tostring(inputRestores),
+        "Post-release camera watchdog recoveries: "..tostring(cameraGuardRecoveries),
+        "Post-release camera watchdog until: "..tostring(math.max(0,postReleaseCameraGuardUntil-os.clock())),
         "Final ending protected: "..tostring(finalProtectedLogged),
         "Only local non-final cinematic visuals/input changed; server timers not modified.",
         "Stopped: "..stopReason,
@@ -1412,7 +1650,7 @@ hook(UserInputService.InputBegan,function(input)
 end)
 pcall(function()RunService:UnbindFromRenderStep(bindName)end)
 RunService:BindToRenderStep(bindName,Enum.RenderPriority.Last.Value+2100,driveCamera)
-emit("READY","Cutscene-only v6 CAMERA FIX: original view handoff, stable release camera, no post-solve facing writes; F8 report.")
+emit("READY","Cutscene-only v6 CINEFIX3: ending-safe handoff; no delayed Custom camera override or stale puzzle overlay restore; F8 report.")
 if not launchCutsceneBypass() then
     emit("ERROR","Imported Chapter2 Main bypass failed to initialize")
 end
@@ -1445,10 +1683,21 @@ task.spawn(function()
             local folder=ReplicatedStorage:FindFirstChild("Puzzles")
             local solved=folder and tonumber(folder:GetAttribute("SolvedPuzzleCount")) or 0
             local leverSolved=folder and folder:GetAttribute("LeverPuzzleSolved")==true or false
+            if solved>=3 and not puzzleReleasePrimed and not endingProtected() then
+                puzzleReleasePrimed=true
+                puzzleBypassUntil=math.max(puzzleBypassUntil,os.clock()+3.5)
+                emit("NONFINAL","3/3 puzzles: local release bypass prearmed before native Skip")
+            end
             if not introDone then
                 hideIntroBlack()
                 local skip=nativeIntroSkip()
-                if skip then maskIntroSkipArtwork(skip) end
+                if skip and not skipManualFallback then maskIntroSkipArtwork(skip) end
+                if skip and introClicks>=3 and skipClickedAt
+                    and seconds()-skipClickedAt>=0.45 and not skipManualFallback then
+                    skipManualFallback=true
+                    restoreIntroSkipArtwork()
+                    emit("INTRO","Skip confirmation missing after retries: native Skip button made visible for manual recovery")
+                end
                 if skip and firstSkipVisibleAt==nil then
                     firstSkipVisibleAt=seconds()
                     emit("INTRO",string.format(
@@ -1493,10 +1742,10 @@ task.spawn(function()
                     and not introCameraReleased then
                     beginIntroCamera()
                 end
-                if skip and not deferSkip and introClicks<2
+                if skip and not deferSkip and introClicks<5
                     and seconds()<42 and seconds()>=nextClickAt then
                     introClicks+=1
-                    nextClickAt=seconds()+1
+                    nextClickAt=seconds()+0.45
                     task.spawn(clickIntroSkip,skip)
                 end
             else
