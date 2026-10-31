@@ -26,11 +26,8 @@ local Players=game:GetService("Players")
 local paths={
     {name="CUTSCENE",file="chapter2-cutscene-deferred-invisible-skip-test.lua",
         base="https://raw.githubusercontent.com/sceneton/needlehub/main/",
-        marker="Beyy Chapter 2 Indexed Cutscene Visuals v1",
-        cache="BeyyHub/chapter2_fork_indexed_cutscene_v1.lua"},
-    {name="HOLD",file="chapter2-puzzle-position-diagnostic.lua",
-        marker="Beyy Chapter 2 Teleport-Hold and Return Diagnostic v9",
-        cache="BeyyHub/chapter2_integrated_v33_return_v9_jumpfix.lua"},
+        marker="Beyy Chapter 2 Indexed Cutscene Visuals v2 PRESERVE LOCATION",
+        cache="BeyyHub/chapter2_fork_indexed_cutscene_v2_preserve.lua"},
     {name="PUZZLES",file="chapter2-no-levers-puzzles-dual-range-test.lua",
         marker="Beyy Chapter 2 No-Levers Puzzle Worker v32 DUAL RANGE TEST",
         cache="BeyyHub/chapter2_integrated_v33_puzzles_v32.lua"},
@@ -166,55 +163,25 @@ local function launch(item)
 end
 -- The bypass toggle can launch its visual/controller module without any puzzle workers.
 if cutsceneOnly then return launch(paths[1]) end
--- Capture the genuine Chapter2 start before any controller moves our
--- character. Preserve its full CFrame, including facing direction.
-local env=_G
-if type(getgenv)=="function" then
-    local ok,global=pcall(getgenv)
-    if ok and type(global)=="table" then env=global end
-end
-local player=Players.LocalPlayer
-local char=player and player.Character
-local root=char and char:FindFirstChild("HumanoidRootPart")
-if not root then
-    local deadline=os.clock()+5
-    repeat
-        task.wait(0.05)
-        player=Players.LocalPlayer
-        char=player and player.Character
-        root=char and char:FindFirstChild("HumanoidRootPart")
-    until root or cancelled() or os.clock()>=deadline
-end
-if cancelled() then return false end
-if root then
-    env.__BEYY_CH2_HOLD_CAPTURE={Character=char,CFrame=root.CFrame}
-    log("Original Chapter2 start saved: "..tostring(root.Position))
+-- The solver owns required room movements. Do not launch the old HOLD
+-- diagnostic: its automatic 3/3 return and rescues targeted the original spawn.
+local folder=game:GetService("ReplicatedStorage"):FindFirstChild("Puzzles")
+local alreadySolved=folder and(tonumber(folder:GetAttribute("SolvedPuzzleCount"))or 0)>=3
+local okPuzzle=true
+if alreadySolved then
+    log("3/3 already complete; puzzle-room entry skipped")
 else
-    fail("No root to capture original start; return-to-start may be unavailable")
+    okPuzzle=launch(paths[2])
 end
-env.__BEYY_CH2_HOLD_FOLLOW_SOLVER=true
-log("INTEGRATED v33: v32 puzzles / v6 invisible deferred Skip / v9 instant return / v27 VacuumPower ONLY")
-log("Loading: cutscene v6 INVISIBLE DEFERRED INTRO -> return v9 -> v32 unchanged solver -> Vacuum Power")
--- The independently saved bypass toggle owns CUTSCENE.
-local okHold=launch(paths[2])
 if cancelled() then return false end
--- Do NOT wait 1.2s or force the diagnostic's 4/5 point. The existing
--- worker chooses its verified room anchor and v9 watches only large snapbacks.
-local okPuzzle=launch(paths[3])
+local okUpgrade=launch(paths[3])
 if cancelled() then return false end
-local okUpgrade=launch(paths[4])
-if cancelled() then return false end
-if not okHold or not okPuzzle or not okUpgrade then
-    fail("Partial puzzle startup: hold="..tostring(okHold)..
-        " puzzle="..tostring(okPuzzle)..
-        " upgrades="..tostring(okUpgrade)..
-        ". Check console for exact module error.")
+if not okPuzzle or not okUpgrade then
+    fail("Partial puzzle startup: puzzle="..tostring(okPuzzle)..
+        " upgrades="..tostring(okUpgrade)..". Check console for exact module error.")
     return false
-else
-    log("Puzzle workers running: v32 native puzzles, v9 instant return, VacuumPower; bypass is independently controlled.")
-    log("3/3: IMMEDIATE return to saved spawn even during cutscene; room snapback correction stays active.")
-    log("F8: combined puzzle/hidden Skip/upgrade report; F9: return report; F12: cancel hold.")
 end
+log("Puzzle/VacuumPower workers running; no automatic return to spawn. Cutscene bypass preserves the current transition pose.")
 return true
 end
 local __BEYY_CH2_NO_LEVERS_STARTED = false
@@ -287,7 +254,7 @@ local function __BEYY_CH2_NO_LEVERS_START()
             if __BEYY_CH2_NO_LEVERS_ON_FAILURE then __BEYY_CH2_NO_LEVERS_ON_FAILURE() end
         end
     end)
-    print("[BeyyHub Chapter2] INTEGRATED v33: v32 puzzles, v6 invisible/deferred Skip, v9 instant hay return, v27 VacuumPower-only; key automation preserved")
+    print("[BeyyHub Chapter2] Auto puzzles and Vacuum Power enabled; position-preserving cutscene handling is independently controlled")
     return true
 end
 -- Independent cutscene switch: a saved bypass ON works even with puzzles OFF.
@@ -2402,13 +2369,13 @@ do
         local puzzleTab = hubWindow:Tab({ Title = "Puzzles", Icon = "puzzle" })
         puzzleTab:Section({ Title = "Chapter 2 Integrated v33" })
         puzzleTab:Paragraph({
-            Title = "v32 Picture / Color / Number + instant hay return",
-            Desc = "v6 invisible/deferred native intro Skip, v9 immediate return to spawn after 3/3, Vacuum Power-only v27. No lever requests; Main key pickup/hand-in remains.",
+            Title = "Picture / Color / Number puzzles",
+            Desc = "Solve the three puzzles without levers. Keep your location after completion; key pickup and hand-in remain available.",
         })
         Registry.Chapter2AutoPuzzles = puzzleTab:Toggle({
             Title = "Auto Solve Puzzles",
             Value = __BEYY_CH2_NO_LEVERS_WANTED,
-            Desc = "Run Picture, Color and Number puzzles, return and Vacuum Power upgrades. Cutscene handling follows the separate Unskippable Cutscene Bypass toggle.",
+            Desc = "Run Picture, Color and Number puzzles and Vacuum Power upgrades. No automatic return to spawn; cutscene handling follows its separate toggle.",
             Callback = function(enabled)
                 if hubUnloaded then return end
                 if enabled then
