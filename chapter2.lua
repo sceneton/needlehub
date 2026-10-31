@@ -26,8 +26,8 @@ local Players=game:GetService("Players")
 local paths={
     {name="CUTSCENE",file="chapter2-cutscene-deferred-invisible-skip-test.lua",
         base="https://raw.githubusercontent.com/sceneton/needlehub/main/",
-        marker="Beyy Chapter 2 Indexed Cutscene Visuals v2 PRESERVE LOCATION",
-        cache="BeyyHub/chapter2_fork_indexed_cutscene_v2_preserve.lua"},
+        marker="Beyy Chapter 2 Indexed Cutscene Visuals v3 PAPERS RETURN",
+        cache="BeyyHub/chapter2_fork_indexed_cutscene_v3_papers.lua"},
     {name="PUZZLES",file="chapter2-no-levers-puzzles-dual-range-test.lua",
         marker="Beyy Chapter 2 No-Levers Puzzle Worker v32 DUAL RANGE TEST",
         cache="BeyyHub/chapter2_integrated_v33_puzzles_v32.lua"},
@@ -433,6 +433,13 @@ local function __beyySameJSON(a, b)
     return true
 end
 local __beyyInitialConfig = __beyyReadConfig(__beyyActiveConfigName())
+local __BEYY_CH2_FARM_ORIGIN
+do
+    local p=game:GetService("Players").LocalPlayer
+    local char=p and p.Character
+    local root=char and char:FindFirstChild("HumanoidRootPart")
+    if root then __BEYY_CH2_FARM_ORIGIN={Character=char,CFrame=root.CFrame}end
+end
 
 if _G.__BEYY_HUB_LOADED then
     pcall(function()
@@ -907,6 +914,7 @@ do
     })
 
     local Registry = {}
+    local paperOnlyControl={Stop=function()end,Busy=function()return false end}
     local autoCutsceneEnableAfterLevers
     local autoCutsceneDisableAfterHandIn
     local cutscenePlayable = false
@@ -2364,8 +2372,8 @@ do
             local levers = puzzles and puzzles:FindFirstChild("LeverPuzzle")
             return levers and levers:FindFirstChild("Levers")
         end
-        sharedFarmPuzzleBusy = __BEYY_CH2_NO_LEVERS_SOLVING
-        keyPuzzleCameraBusy = __BEYY_CH2_NO_LEVERS_SOLVING
+        sharedFarmPuzzleBusy = function()return __BEYY_CH2_NO_LEVERS_SOLVING()or paperOnlyControl.Busy()end
+        keyPuzzleCameraBusy = sharedFarmPuzzleBusy
         local puzzleTab = hubWindow:Tab({ Title = "Puzzles", Icon = "puzzle" })
         puzzleTab:Section({ Title = "Chapter 2 Integrated v33" })
         puzzleTab:Paragraph({
@@ -2379,6 +2387,7 @@ do
             Callback = function(enabled)
                 if hubUnloaded then return end
                 if enabled then
+                    paperOnlyControl.Stop()
                     __BEYY_CH2_NO_LEVERS_START()
                 else
                     __BEYY_CH2_NO_LEVERS_STOP(false)
@@ -2389,6 +2398,188 @@ do
             local toggle = Registry.Chapter2AutoPuzzles
             if not hubUnloaded and toggle and toggle.Value then toggle:Set(false) end
         end
+
+        (function()
+            local env=_G
+            if type(getgenv)=="function"then
+                local ok,value=pcall(getgenv)
+                if ok and type(value)=="table"then env=value end
+            end
+            local runner,loading,generation=nil,false,0
+            local movementOwner={}
+            local status=puzzleTab:Paragraph({Title="Papers & Code Status",Desc="Ready"})
+            local function describe(message)if not hubUnloaded then status:SetDesc(message)end end
+            paperOnlyControl.Stop=function()
+                generation+=1;loading=false
+                if runner then runner.Stop();runner=nil end
+                local marker=env.__BEYY_CH2_INTENTIONAL_MOVE
+                if marker and marker.Owner==movementOwner then env.__BEYY_CH2_INTENTIONAL_MOVE=nil end
+            end
+            paperOnlyControl.Busy=function()return loading or(runner and runner.Running)or false end
+            local previousPaperCleanup=_G.__BEYY_HUB_CLEANUP
+            _G.__BEYY_HUB_CLEANUP=function()
+                paperOnlyControl.Stop()
+                if previousPaperCleanup then pcall(previousPaperCleanup)end
+            end
+            local function startPapers()
+                if hubUnloaded or paperOnlyControl.Busy()then return end
+                local auto=Registry.Chapter2AutoPuzzles
+                if auto and auto.Value then auto:Set(false)else __BEYY_CH2_NO_LEVERS_STOP(false)end
+                generation+=1
+                local token=generation
+                loading=true;describe("Loading papers-only mode")
+                task.spawn(function()
+                    local function current()return not hubUnloaded and generation==token end
+                    local ok,err=pcall(function()
+                        while __BEYY_CH2_NO_LEVERS_LOADING do
+                            if not current()then return end
+                            task.wait(0.05)
+                        end
+                        if not current()then return end
+                        local body=game:HttpGet("https://raw.githubusercontent.com/sceneton/needlehub/main/chapter2-papers-only.lua?refresh="..tostring(os.time()))
+                        if not current()then return end
+                        assert(type(body)=="string"and body:find("Beyy Chapter 2 Papers Only v1",1,true),"Papers worker download is invalid")
+                        local compiled,compileError=loadstring(body)
+                        assert(compiled,tostring(compileError))
+                        local factory=compiled()
+                        assert(type(factory)=="function","Papers worker factory is missing")
+                        local context
+                        local nextResolve=0
+                        local function protected()
+                            if not current()or LocalPlayer:GetAttribute("NeedleOwned")==true or LocalPlayer:GetAttribute("NeedleRoundComplete")==true then return true end
+                            if context then
+                                local char=LocalPlayer.Character
+                                local hum=char and char:FindFirstChildOfClass("Humanoid")
+                                return char~=context.Character or farmRoot()~=context.Root or not hum or hum.Health<=0
+                            end
+                            return false
+                        end
+                        local function checked()
+                            assert(not protected(),"Character changed, mode stopped or ending protected")
+                        end
+                        local function floorPoint(target,root,range,isHay)
+                            local char=LocalPlayer.Character
+                            local hum=char and char:FindFirstChildOfClass("Humanoid")
+                            if not hum then return nil end
+                            local params=RaycastParams.new()
+                            params.FilterType=Enum.RaycastFilterType.Exclude;params.RespectCanCollide=true
+                            local exclude={char}
+                            local puzzles=Workspace:FindFirstChild("Puzzles")
+                            if puzzles then exclude[#exclude+1]=puzzles end
+                            if isHay then
+                                for _,name in ipairs({"HaystackClient","HaystackCollision"})do
+                                    local folder=Workspace:FindFirstChild(name)
+                                    if folder then exclude[#exclude+1]=folder end
+                                end
+                            end
+                            params.FilterDescendantsInstances=exclude
+                            local best,score
+                            for _,radius in ipairs(isHay and{6,10}or{3,5})do
+                                for i=0,7 do
+                                    local angle=i*math.pi/4
+                                    local start=target+Vector3.new(math.cos(angle)*radius,8,math.sin(angle)*radius)
+                                    local hit=Workspace:Raycast(start,Vector3.new(0,-60,0),params)
+                                    if hit and hit.Normal.Y>=0.8 then
+                                        local at=hit.Position+Vector3.new(0,hum.HipHeight+root.Size.Y*0.5,0)
+                                        local d=(at-target).Magnitude
+                                        local travel=(at-root.Position).Magnitude
+                                        if d<=range and math.abs(at.Y-root.Position.Y)<12 and(not score or travel<score)then best,score=at,travel end
+                                    end
+                                end
+                            end
+                            return best
+                        end
+                        local function hayReturn(root)
+                            local folder=Workspace:FindFirstChild("HaystackClient")
+                            if not folder then return nil end
+                            local nearest,nearestDistance
+                            local originDistance=math.huge
+                            local origin=__BEYY_CH2_FARM_ORIGIN
+                            local items=(haySnapshotFolder==folder and hayChildrenSnapshot)or folder:GetChildren()
+                            for _,item in ipairs(items or{})do
+                                if item.Parent==folder then
+                                    local part=item:IsA("BasePart")and item or(item:IsA("Model")and(item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart",true)))
+                                    if part then
+                                        local distance=(part.Position-root.Position).Magnitude
+                                        if not nearestDistance or distance<nearestDistance then nearest,nearestDistance=part,distance end
+                                        if origin and origin.Character==LocalPlayer.Character then originDistance=math.min(originDistance,(part.Position-origin.CFrame.Position).Magnitude)end
+                                    end
+                                end
+                            end
+                            if not nearest then return nil end
+                            if nearestDistance<=35 then return root.CFrame end
+                            if origin and origin.Character==LocalPlayer.Character and originDistance<=45 then return origin.CFrame end
+                            local point=floorPoint(nearest.Position,root,18,true)
+                            return point and(CFrame.new(point)*root.CFrame.Rotation)or nil
+                        end
+                        local function resolve()
+                            if os.clock()<nextResolve then return nil end
+                            nextResolve=os.clock()+0.25
+                            checked()
+                            local char=LocalPlayer.Character
+                            local root=farmRoot()
+                            local hum=char and char:FindFirstChildOfClass("Humanoid")
+                            local worldPuzzles=Workspace:FindFirstChild("Puzzles")
+                            local number=worldPuzzles and worldPuzzles:FindFirstChild("NumberPuzzle")
+                            local remotes=ReplicatedStorage:FindFirstChild("Puzzles")
+                            local state=remotes and remotes:FindFirstChild("PuzzleState")
+                            local action=remotes and remotes:FindFirstChild("PuzzleAction")
+                            local posters=number and number:FindFirstChild("Posters")
+                            local keypad=number and number:FindFirstChild("Keypad")
+                            if not root or not hum or hum.Health<=0 or not posters or not keypad
+                                or not state or not state:IsA("RemoteEvent")or not action or not action:IsA("RemoteEvent")then return nil end
+                            local home=hayReturn(root)
+                            if not home then return nil end
+                            context={Character=char,Root=root,State=state,Action=action,Feedback=remotes:FindFirstChild("PuzzleFeedback"),
+                                Posters=posters,Keypad=keypad,Home=home}
+                            return context
+                        end
+                        local function moveRoot(pose)
+                            checked()
+                            local deadline=os.clock()+4
+                            while context.Root.Anchored and os.clock()<deadline do task.wait(0.05);checked()end
+                            assert(not context.Root.Anchored,"Character is still anchored by the cutscene")
+                            env.__BEYY_CH2_INTENTIONAL_MOVE={Owner=movementOwner,Root=context.Root,Pose=pose,At=os.clock()}
+                            context.Root.CFrame=pose
+                            context.Root.AssemblyLinearVelocity=Vector3.zero
+                            context.Root.AssemblyAngularVelocity=Vector3.zero
+                        end
+                        runner=factory({
+                            Now=os.clock,Wait=task.wait,Spawn=task.spawn,Status=describe,Resolve=resolve,Protected=protected,
+                            IntroFinished=function()return LocalPlayer:GetAttribute("IntroCutsceneFinished")==true end,
+                            MoveNear=function(target,isKeypad)
+                                checked()
+                                local point=target:IsA("BasePart")and target.Position or target:GetPivot().Position
+                                local range=isKeypad and 6.1 or 7.5
+                                for attempt=1,3 do
+                                    if(context.Root.Position-point).Magnitude<=range then return end
+                                    local spot=floorPoint(point,context.Root,range,false)
+                                    assert(spot,"No floor-supported position near paper/keypad")
+                                    moveRoot(CFrame.new(spot)*context.Root.CFrame.Rotation)
+                                    task.wait(0.15);checked()
+                                end
+                                assert((context.Root.Position-point).Magnitude<=range,"Server did not retain interaction position")
+                            end,
+                            ReturnHome=function()
+                                checked()
+                                if(context.Root.Position-context.Home.Position).Magnitude>0.75 then moveRoot(context.Home)end
+                            end,
+                        })
+                        if not current()then runner.Stop();return end
+                        loading=false
+                        runner.Start()
+                    end)
+                    if current()then
+                        loading=false
+                        if not ok then describe("Could not start: "..tostring(err))end
+                    end
+                end)
+            end
+            puzzleTab:Button({Title="Collect Papers & Enter Code",
+                Desc="Collect only Number Puzzle papers, submit the code, then return to the haypile. Stops Auto Solve Puzzles.",
+                Callback=startPapers})
+            puzzleTab:Button({Title="Stop Papers & Code",Callback=function()paperOnlyControl.Stop();describe("Stopped")end})
+        end)()
 
     do
         local overview = overviewTab
