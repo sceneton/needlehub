@@ -1208,10 +1208,63 @@ local function createFarmerApproach(options)
 end
 
 
+local function createFarmerCameraLock(options)
+    local api={}
+    local active,farmer,root,camera,savedType,lastView=false,nil,nil,nil,nil,nil
+    local function handoff()
+        local shared=options.Shared()
+        return(shared and(shared:GetAttribute("PotionHandedInBy")~=nil or shared:GetAttribute("PotionCutsceneAt")~=nil))
+            or options.Player:GetAttribute("CutsceneActive")==true or options.Player:GetAttribute("NeedleInputLocked")==true
+    end
+    function api.Stop(gameOwnsCamera)
+        if not active then return end
+        active=false
+        if not gameOwnsCamera and not handoff()and options.World.CurrentCamera==camera
+            and camera.CameraType==Enum.CameraType.Scriptable and camera.CFrame==lastView then
+            local char=options.Player.Character
+            local hum=char and char:FindFirstChildOfClass("Humanoid")
+            if hum then camera.CameraSubject=hum end
+            camera.CameraType=savedType==Enum.CameraType.Scriptable and Enum.CameraType.Custom or savedType
+            -- Keep the current view beside the farmer. Never restore an old CFrame.
+        end
+        farmer=nil;root=nil;camera=nil;lastView=nil
+    end
+    function api.IsLocked()return active end
+    function api.Step()
+        if not active then return end
+        if handoff()then api.Stop(true);return end
+        local char=options.Player.Character
+        local current=char and char:FindFirstChild("HumanoidRootPart")
+        local hum=char and char:FindFirstChildOfClass("Humanoid")
+        if not options.Enabled()or current~=root or not hum or hum.Health<=0
+            or options.Player:GetAttribute("NeedleOwned")~=true then api.Stop(false);return end
+        if options.World.CurrentCamera~=camera or not farmer.Parent then api.Stop(true);return end
+        local target=farmer:FindFirstChild("Torso")or farmer:FindFirstChild("Head")or farmer:FindFirstChild("HumanoidRootPart")
+        if not target then api.Stop(false);return end
+        local eye=root.Position+Vector3.new(0,1.5,0)
+        if(target.Position-eye).Magnitude<0.1 then return end
+        camera.CameraType=Enum.CameraType.Scriptable
+        lastView=CFrame.lookAt(eye,target.Position)
+        camera.CFrame=lastView
+        camera.Focus=CFrame.new(target.Position)
+    end
+    function api.Start(target,currentRoot)
+        if active and farmer==target and root==currentRoot then api.Step();return end
+        api.Stop(false)
+        local currentCamera=options.World.CurrentCamera
+        if not currentCamera then return end
+        active=true;farmer=target;root=currentRoot;camera=currentCamera;savedType=camera.CameraType
+        api.Step()
+    end
+    return api
+end
+
+
 local function createFarmerClick(options)
     return function(farmer,allowed)
         local camera=options.World.CurrentCamera
         assert(camera,"Camera unavailable for potion hand-in")
+        local persistent=options.ViewLocked and options.ViewLocked()
         local savedType,savedView=camera.CameraType,camera.CFrame
         local char=options.Player.Character
         local head=char and(char:FindFirstChild("Head")or char:FindFirstChild("HumanoidRootPart"))
@@ -1276,7 +1329,7 @@ local function createFarmerClick(options)
         end
         -- Restore a temporary aim only while we still own it. A starting potion
         -- cinematic gets camera ownership immediately.
-        if aimed and options.World.CurrentCamera==camera and camera.CameraType==Enum.CameraType.Scriptable
+        if not persistent and aimed and options.World.CurrentCamera==camera and camera.CameraType==Enum.CameraType.Scriptable
             and camera.CFrame==aimed and not handoff()then
             camera.CFrame=savedView;camera.CameraType=savedType
         end
@@ -1310,19 +1363,20 @@ local function createPotionHandIn(options)
         local untilAt=options.Now()+seconds
         repeat options.Wait(0.05);check()until options.Now()>=untilAt
     end
-    function api.Stop()alive=false;busy=false;stationed=false;pending=nil;character=nil;tripRoot=nil end
+    local function unlock(handoff)if options.UnlockView then options.UnlockView(handoff)end end
+    function api.Stop()alive=false;busy=false;stationed=false;pending=nil;character=nil;tripRoot=nil;unlock(false)end
     function api.IsBusy()return busy or stationed end
     function api.Tick()
         if not alive then return end
         if not options.Enabled()then
-            busy=false;stationed=false;pending=nil;character=nil;tripRoot=nil;attempts=0;retryAt=0;status("Disabled");return
+            busy=false;stationed=false;pending=nil;character=nil;tripRoot=nil;attempts=0;retryAt=0;unlock(false);status("Disabled");return
         end
         -- Acknowledgement can arrive together with a cutscene/input lock.
         -- Observe it before checking locks; do not move or send again afterwards.
-        if accepted()then pending=nil;busy=false;stationed=false;status("Potion accepted by farmer; boss sequence started");return end
+        if accepted()then pending=nil;busy=false;stationed=false;unlock(true);status("Potion accepted by farmer; boss sequence started");return end
         local char,root,hum=options.Character()
         if character and(char~=character or root~=tripRoot)then
-            character=nil;tripRoot=nil;pending=nil;busy=false;stationed=false;attempts=0
+            character=nil;tripRoot=nil;pending=nil;busy=false;stationed=false;attempts=0;unlock(false)
         end
         if pending then
             if options.Now()<pending.Until then status("Waiting for farmer to accept potion");return end
@@ -1333,7 +1387,7 @@ local function createPotionHandIn(options)
         end
         if options.Now()<retryAt then return end
         if not allowed()then status("Paused during menu, cutscene or boss fight");return end
-        if options.Player:GetAttribute("NeedleOwned")~=true then status("Waiting to receive the sundial potion");return end
+        if options.Player:GetAttribute("NeedleOwned")~=true then stationed=false;unlock(false);status("Waiting to receive the sundial potion");return end
         local sundial=options.World:FindFirstChild("Sundial")
         if not sundial or sundial:GetAttribute("Solved")~=true then status("Waiting for sundial completion");return end
         local npcs=options.World:FindFirstChild("NPC")
@@ -1350,12 +1404,14 @@ local function createPotionHandIn(options)
                 check();root.CFrame=pose
                 root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero
                 stationed=true
+                if options.LockView then options.LockView(farmer,root)end
                 pause(0.25)
             end
             check()
+            if options.LockView then options.LockView(farmer,root)end
             assert(options.Equip(),"Potion slot is not ready")
             pause(0.1)
-            if accepted()then busy=false;stationed=false;return end
+            if accepted()then busy=false;stationed=false;unlock(true);return end
             check()
             assert(options.Player:GetAttribute("NeedleOwned")==true,"Potion ownership changed")
             assert(farmer.Parent==npcs and(root.Position-farmer:GetPivot().Position).Magnitude<=14,"Farmer moved outside hand-in range")
@@ -2034,7 +2090,7 @@ end
     local sundialStatus=tabletTab:Paragraph({Title="Sundial Status",Desc="Disabled"})
     tabletTab:Section({Title="Potion"})
     farmToggle(tabletTab,"AutoBringPotion","Auto Bring Potion to Farmer",
-        "Equip the sundial potion, aim at the farmer and click to deliver it. This starts the boss fight. Close the menu to run.")
+        "Teleport beside the farmer, keep the camera locked on him and click to give the potion. This starts the boss fight. Close the menu to run.")
     local potionStatus=tabletTab:Paragraph({Title="Potion Hand-in Status",Desc="Disabled"})
     shopTab:Section({ Title="Purchasing" })
     Registry.BuyToolsList = shopTab:Dropdown({
@@ -2406,7 +2462,20 @@ end
         local potionOptions=table.clone(interactionOptions)
         potionOptions.Player=LocalPlayer
         potionOptions.Approach=createFarmerApproach({World=Workspace,Player=LocalPlayer})
+        local farmerView=createFarmerCameraLock({
+            World=Workspace,Player=LocalPlayer,
+            Shared=function()return ReplicatedStorage:FindFirstChild("NeedleHaystack")end,
+            Enabled=function()return not hubUnloaded and sharedFarmState.AutoBringPotion==true and hubWindow.Closed==true end,
+        })
+        local farmerViewId="BeyyCh5PotionView_"..tostring(os.clock())
+        RunService:BindToRenderStep(farmerViewId,Enum.RenderPriority.Camera.Value+10,function()
+            local ok=pcall(farmerView.Step)
+            if not ok then farmerView.Stop(false)end
+        end)
+        potionOptions.LockView=farmerView.Start
+        potionOptions.UnlockView=farmerView.Stop
         potionOptions.Click=createFarmerClick({
+            ViewLocked=farmerView.IsLocked,
             World=Workspace,Player=LocalPlayer,Input=VirtualInputManager,Wait=task.wait,
             FrameWait=function()RunService.RenderStepped:Wait()end,
             MouseLocked=function()return game:GetService("UserInputService").MouseBehavior==Enum.MouseBehavior.LockCenter end,
@@ -2436,6 +2505,8 @@ end
             tabletController.Stop()
             sundialController.Stop()
             potionController.Stop()
+            farmerView.Stop(false)
+            pcall(function()RunService:UnbindFromRenderStep(farmerViewId)end)
             if previous then pcall(previous)end
         end
         spawnChapterWorker(function()
