@@ -1,7 +1,7 @@
 -- BeyyHub v103.00 | direct-branch loader with AFK replay recovery
 -- Resolves the current revision and keeps validated AFK recovery caches.
 local VERSION = "103.00"
-local BASE = "https://raw.githubusercontent.com/BeyyTU/needlehub/main/"
+local BASE = "https://raw.githubusercontent.com/sceneton/needlehub/main/"
 local MODULES = {
     [77108422251420] = {file="lobby.lua", name="Lobby"},
     [108628039999641] = {file="chapter1.lua", name="Chapter1"},
@@ -29,11 +29,11 @@ local selectedRevision=...
 if not validRevision(selectedRevision) then
     local ok,info=pcall(function()
         return game:GetService("HttpService"):JSONDecode(game:HttpGet(
-            "https://api.github.com/repos/BeyyTU/needlehub/commits/main?refresh="..tostring(os.time()).."-"..tostring(math.random(1,1000000000))))
+            "https://api.github.com/repos/sceneton/needlehub/commits/main?refresh="..tostring(os.time()).."-"..tostring(math.random(1,1000000000))))
     end)
     selectedRevision=ok and type(info)=="table" and info.sha or nil
 end
-local revisionPath=CACHE_FOLDER.."/afk_replay_revision_v103.txt"
+local revisionPath=CACHE_FOLDER.."/afk_replay_revision_v103_sceneton.txt"
 if validRevision(selectedRevision) then
     if type(writefile)=="function" then pcall(writefile,revisionPath,selectedRevision) end
 elseif type(readfile)=="function" then
@@ -41,7 +41,7 @@ elseif type(readfile)=="function" then
     selectedRevision=ok and validRevision(value) and value or nil
 end
 local DOWNLOAD_BASE=validRevision(selectedRevision)
-    and ("https://raw.githubusercontent.com/BeyyTU/needlehub/"..selectedRevision.."/") or BASE
+    and ("https://raw.githubusercontent.com/sceneton/needlehub/"..selectedRevision.."/") or BASE
 local begin = os.clock()
 local requests, compileSeconds = 0, 0
 local lastModuleFailure = nil
@@ -123,11 +123,13 @@ end
 if type(writefile)=="function" then
     local cached
     if type(readfile)=="function" then local ok,value=pcall(readfile,LOADER_CACHE);if ok then cached=value end end
-    local validCache=type(cached)=="string" and cached:find("afk_replay_loader_v103.lua",1,true)
+    local validCache=type(cached)=="string" and cached:find("https://raw.githubusercontent.com/sceneton/needlehub/",1,true)
+        and cached:find("afk_replay_loader_v103.lua",1,true)
         and cached:find('local VERSION = "'..VERSION..'"',1,true) and loadstring(cached)
     if not validCache then
         local ok,value=pcall(fetch,DOWNLOAD_BASE.."loader.lua")
-        if ok and type(value)=="string" and value:find("afk_replay_loader_v103.lua",1,true)
+        if ok and type(value)=="string" and value:find("https://raw.githubusercontent.com/sceneton/needlehub/",1,true)
+            and value:find("afk_replay_loader_v103.lua",1,true)
             and value:find('local VERSION = "'..VERSION..'"',1,true) and loadstring(value) then
             pcall(writefile,LOADER_CACHE,value)
         end
@@ -143,27 +145,29 @@ local queue = (type(queue_on_teleport) == "function" and queue_on_teleport)
     or (type(env.queue_on_teleport) == "function" and env.queue_on_teleport)
     or (type(env.queueonteleport) == "function" and env.queueonteleport)
     or (type(env.queue_on_tp) == "function" and env.queue_on_tp)
-if queue and _G.__BEYY_NEEDLEHUB_RELOAD_JOB~=game.JobId then
+if queue and _G.__BEYY_SCENETON_NEEDLEHUB_RELOAD_JOB~=game.JobId then
     local payload = [==[
         local H=game:GetService("HttpService")
         local revision
         local resolved,info=pcall(function()
-            return H:JSONDecode(game:HttpGet("https://api.github.com/repos/BeyyTU/needlehub/commits/main?refresh="..tostring(os.time()).."-"..tostring(math.random(1,1000000000))))
+            return H:JSONDecode(game:HttpGet("https://api.github.com/repos/sceneton/needlehub/commits/main?refresh="..tostring(os.time()).."-"..tostring(math.random(1,1000000000))))
         end)
         if resolved and type(info)=="table" and type(info.sha)=="string" and #info.sha==40 and info.sha:match("^%x+$") then revision=info.sha end
-        local url="https://raw.githubusercontent.com/BeyyTU/needlehub/"..(revision or "main").."/loader.lua"
+        local url="https://raw.githubusercontent.com/sceneton/needlehub/"..(revision or "main").."/loader.lua"
         local body
         for attempt=1,3 do
             local ok,source=pcall(function()
                 return game:HttpGet(url.."?refresh="..tostring(os.time()).."-"..tostring(math.random(1,1000000000)))
             end)
-            if ok and type(source)=="string" and source:find('local VERSION = "103.00"',1,true)
+            if ok and type(source)=="string" and source:find("https://raw.githubusercontent.com/sceneton/needlehub/",1,true)
+                and source:find('local VERSION = "103.00"',1,true)
                 and source:find("afk_replay_loader_v103.lua",1,true) and loadstring(source) then body=source;break end
             if attempt<3 then task.wait(attempt*0.5) end
         end
         if not body and type(readfile)=="function" then
             local ok,cached=pcall(readfile,"BeyyHub/afk_replay_loader_v103.lua")
-            if ok and type(cached)=="string" and cached:find('local VERSION = "103.00"',1,true)
+            if ok and type(cached)=="string" and cached:find("https://raw.githubusercontent.com/sceneton/needlehub/",1,true)
+                and cached:find('local VERSION = "103.00"',1,true)
                 and cached:find("afk_replay_loader_v103.lua",1,true) and loadstring(cached) then body=cached end
         end
         if not body then warn("[BeyyHub] No validated online or cached AFK router; reattach and rerun the loader");return end
@@ -174,7 +178,7 @@ if queue and _G.__BEYY_NEEDLEHUB_RELOAD_JOB~=game.JobId then
         if not succeeded then warn("[BeyyHub] Teleport loader error: "..tostring(runtimeError)) end
     ]==]
     local ok, err = pcall(queue, payload)
-    if ok then _G.__BEYY_NEEDLEHUB_RELOAD_JOB=game.JobId
+    if ok then _G.__BEYY_SCENETON_NEEDLEHUB_RELOAD_JOB=game.JobId
     else warn("[BeyyHub] Teleport queue failed: " .. tostring(err)) end
 elseif queue then
     print("[BeyyHub] Teleport reload already armed for this session")
