@@ -2464,7 +2464,7 @@ do
                         if not current()then return end
                         local body=game:HttpGet("https://raw.githubusercontent.com/sceneton/needlehub/"..(__BEYY_CH2_SOURCE_REVISION or "main").."/chapter2-papers-only.lua?refresh="..tostring(os.time()))
                         if not current()then return end
-                        assert(type(body)=="string"and body:find("Beyy Chapter 2 Papers Only v1",1,true),"Papers worker download is invalid")
+                        assert(type(body)=="string"and body:find("Beyy Chapter 2 Papers Only v2",1,true),"Papers worker download is invalid")
                         local compiled,compileError=loadstring(body)
                         assert(compiled,tostring(compileError))
                         local factory=compiled()
@@ -2509,7 +2509,7 @@ do
                                         local at=hit.Position+Vector3.new(0,hum.HipHeight+root.Size.Y*0.5,0)
                                         local d=(at-target).Magnitude
                                         local travel=(at-root.Position).Magnitude
-                                        if d<=range and math.abs(at.Y-root.Position.Y)<12 and(not score or travel<score)then best,score=at,travel end
+                                        if d<=range and(isHay or math.abs(at.Y-root.Position.Y)<12)and(not score or travel<score)then best,score=at,travel end
                                     end
                                 end
                             end
@@ -2519,22 +2519,19 @@ do
                             local folder=Workspace:FindFirstChild("HaystackClient")
                             if not folder then return nil end
                             local nearest,nearestDistance
-                            local originDistance=math.huge
                             local origin=__BEYY_CH2_FARM_ORIGIN
+                            local reference=origin and origin.Character==LocalPlayer.Character and origin.CFrame.Position or root.Position
                             local items=(haySnapshotFolder==folder and hayChildrenSnapshot)or folder:GetChildren()
                             for _,item in ipairs(items or{})do
                                 if item.Parent==folder then
                                     local part=item:IsA("BasePart")and item or(item:IsA("Model")and(item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart",true)))
                                     if part then
-                                        local distance=(part.Position-root.Position).Magnitude
+                                        local distance=(part.Position-reference).Magnitude
                                         if not nearestDistance or distance<nearestDistance then nearest,nearestDistance=part,distance end
-                                        if origin and origin.Character==LocalPlayer.Character then originDistance=math.min(originDistance,(part.Position-origin.CFrame.Position).Magnitude)end
                                     end
                                 end
                             end
                             if not nearest then return nil end
-                            if nearestDistance<=35 then return root.CFrame end
-                            if origin and origin.Character==LocalPlayer.Character and originDistance<=45 then return origin.CFrame end
                             local point=floorPoint(nearest.Position,root,18,true)
                             return point and(CFrame.new(point)*root.CFrame.Rotation)or nil
                         end
@@ -2572,7 +2569,6 @@ do
                         end
                         runner=factory({
                             Now=os.clock,Wait=task.wait,Spawn=task.spawn,Status=describe,Resolve=resolve,Protected=protected,
-                            IntroFinished=function()return LocalPlayer:GetAttribute("IntroCutsceneFinished")==true end,
                             MoveNear=function(target,isKeypad)
                                 checked()
                                 local point=target:IsA("BasePart")and target.Position or target:GetPivot().Position
@@ -2588,7 +2584,17 @@ do
                             end,
                             ReturnHome=function()
                                 checked()
-                                if(context.Root.Position-context.Home.Position).Magnitude>0.75 then moveRoot(context.Home)end
+                                describe("Returning to haypile; checking position")
+                                for attempt=1,3 do
+                                    if(context.Root.Position-context.Home.Position).Magnitude>0.75 then moveRoot(context.Home)end
+                                    local retained=true
+                                    for check=1,3 do
+                                        task.wait(0.2);checked()
+                                        if(context.Root.Position-context.Home.Position).Magnitude>3 then retained=false;break end
+                                    end
+                                    if retained then return end
+                                end
+                                error("Haypile return was moved back by the game after 3 attempts")
                             end,
                         })
                         if not current()then runner.Stop();return end
