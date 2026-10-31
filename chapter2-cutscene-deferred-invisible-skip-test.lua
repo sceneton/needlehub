@@ -1,5 +1,5 @@
 -- Beyy Chapter 2 Cutscene-Only Standalone v6 INVISIBLE DEFERRED SKIP TEST
--- Beyy Chapter 2 Indexed Cutscene Visuals v2 PRESERVE LOCATION
+-- Beyy Chapter 2 Indexed Cutscene Visuals v3 PAPERS RETURN
 -- Intro: defer native Skip until puzzles finish, visually mask Skip GUI while keeping its native click enabled.
 -- Non-final lever/puzzle cinematics: local camera/input/overlay recovery only.
 -- No puzzle or lever actions, hay teleport, progression remotes, or final-ending bypass.
@@ -206,6 +206,14 @@ local function createIntroLocationPreserver(options)
         if done and not release and now-(releaseClearedAt or confirmedAt)>=2 then
             api.Stop("Intro/release finished plus 2s grace");return
         end
+        local intentional=options.IntentionalMove and options.IntentionalMove()
+        if intentional and intentional.Root==root and type(intentional.At)=="number"
+            and now-intentional.At>=0 and now-intentional.At<=0.5 and intentional.Pose
+            and(root.Position-intentional.Pose.Position).Magnitude<3 then
+            pending=nil;pendingVelocity=nil
+            lastPose=root.CFrame;lastVelocity=root.AssemblyLinearVelocity
+            return
+        end
         local nearSpawn=(root.Position-spawnPose.Position).Magnitude<8
         if pending and not nearSpawn then pending=nil;pendingVelocity=nil end
         if not pending and nearSpawn and(root.Position-lastPose.Position).Magnitude>20
@@ -231,7 +239,8 @@ local function createIntroLocationPreserver(options)
     return api
 end
 local locationPreserver=createIntroLocationPreserver({Player=function()return player end,Now=os.clock,
-    Protected=endingProtected,Log=function(message)emit("POSITION",message)end})
+    Protected=endingProtected,IntentionalMove=function()return env.__BEYY_CH2_INTENTIONAL_MOVE end,
+    Log=function(message)emit("POSITION",message)end})
 local function nativeIntroSkip()
     if not player or endingProtected()
         or player:GetAttribute("IntroCutsceneFinished")==true then return nil end
