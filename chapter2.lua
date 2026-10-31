@@ -11,7 +11,8 @@ end
 -- Chapter 2 integrated v33. This is the SAME four-module launcher as
 -- chapter2-no-levers-cutscene-test.lua, embedded without an extra HTTP fetch.
 -- Replaces the legacy 2,000-line v23 puzzle/cutscene controller entirely.
-local __BEYY_CH2_NO_LEVERS_RUN = function()
+local __BEYY_CH2_NO_LEVERS_RUN = function(cancelled)
+    cancelled = cancelled or function() return false end
 -- Beyy Chapter 2 Standalone Integrated v33 (v32 puzzles / v6 invisible Skip / v9 return / v27 VacuumPower)
 -- Canonical Chapter 2 standalone entry point; replaces legacy v26 workflow.
 -- Same four components as the latest tested experiment:
@@ -25,10 +26,10 @@ local Players=game:GetService("Players")
 local paths={
     {name="CUTSCENE",file="chapter2-cutscene-deferred-invisible-skip-test.lua",
         marker="Beyy Chapter 2 Cutscene-Only Standalone v6 INVISIBLE DEFERRED SKIP TEST",
-        cache="BeyyHub/chapter2_integrated_v33_cutscene_v6_camfix1.lua"},
+        cache="BeyyHub/chapter2_integrated_v33_cutscene_v6_cinefix1.lua"},
     {name="HOLD",file="chapter2-puzzle-position-diagnostic.lua",
         marker="Beyy Chapter 2 Teleport-Hold and Return Diagnostic v9",
-        cache="BeyyHub/chapter2_integrated_v33_return_v9_camfix1.lua"},
+        cache="BeyyHub/chapter2_integrated_v33_return_v9_jumpfix.lua"},
     {name="PUZZLES",file="chapter2-no-levers-puzzles-dual-range-test.lua",
         marker="Beyy Chapter 2 No-Levers Puzzle Worker v32 DUAL RANGE TEST",
         cache="BeyyHub/chapter2_integrated_v33_puzzles_v32.lua"},
@@ -57,6 +58,7 @@ local function request(item,attempt)
         "-"..tostring(attempt))
 end
 local function fetch(item,allowCache)
+    if cancelled() then return nil,"cancelled",nil end
     -- A lobby preflight saves the exact verified component to the executor's
     -- disk when available; Chapter 2 uses it without another network request.
     if allowCache and type(readfile)=="function" then
@@ -69,6 +71,7 @@ local function fetch(item,allowCache)
     end
     local reason="no response"
     for attempt=1,3 do
+        if cancelled() then return nil,"cancelled",nil end
         local ok,body=pcall(request,item,attempt)
         if ok and valid(body,item) then
             local fn,err=compile(body)
@@ -145,7 +148,9 @@ if game.PlaceId~=CHAPTER2 then
     return
 end
 local function launch(item)
+    if cancelled() then return false end
     local fn,source=fetch(item,true)
+    if cancelled() then return false end
     if not fn then
         fail(item.name.." could not start: "..tostring(source))
         return false
@@ -175,8 +180,9 @@ if not root then
         player=Players.LocalPlayer
         char=player and player.Character
         root=char and char:FindFirstChild("HumanoidRootPart")
-    until root or os.clock()>=deadline
+    until root or cancelled() or os.clock()>=deadline
 end
+if cancelled() then return false end
 if root then
     env.__BEYY_CH2_HOLD_CAPTURE={Character=char,CFrame=root.CFrame}
     log("Original Chapter2 start saved: "..tostring(root.Position))
@@ -187,11 +193,15 @@ env.__BEYY_CH2_HOLD_FOLLOW_SOLVER=true
 log("INTEGRATED v33: v32 puzzles / v6 invisible deferred Skip / v9 instant return / v27 VacuumPower ONLY")
 log("Loading: cutscene v6 INVISIBLE DEFERRED INTRO -> return v9 -> v32 unchanged solver -> Vacuum Power")
 local okCutscene=launch(paths[1])
+if cancelled() then return false end
 local okHold=launch(paths[2])
+if cancelled() then return false end
 -- Do NOT wait 1.2s or force the diagnostic's 4/5 point. The existing
 -- worker chooses its verified room anchor and v9 watches only large snapbacks.
 local okPuzzle=launch(paths[3])
+if cancelled() then return false end
 local okUpgrade=launch(paths[4])
+if cancelled() then return false end
 if not okCutscene or not okHold or not okPuzzle or not okUpgrade then
     fail("Partial startup: cutscene="..tostring(okCutscene)..
         " hold="..tostring(okHold)..
@@ -209,6 +219,10 @@ end
 local __BEYY_CH2_NO_LEVERS_STARTED = false
 local __BEYY_CH2_NO_LEVERS_DISABLED = false
 local __BEYY_CH2_NO_LEVERS_FAILED = false
+local __BEYY_CH2_NO_LEVERS_WANTED = false
+local __BEYY_CH2_NO_LEVERS_LOADING = false
+local __BEYY_CH2_NO_LEVERS_GENERATION = 0
+local __BEYY_CH2_NO_LEVERS_ON_FAILURE
 local function __BEYY_CH2_NO_LEVERS_SOLVING()
     if not __BEYY_CH2_NO_LEVERS_STARTED or __BEYY_CH2_NO_LEVERS_FAILED then return false end
     local folder = game:GetService("ReplicatedStorage"):FindFirstChild("Puzzles")
@@ -216,8 +230,7 @@ local function __BEYY_CH2_NO_LEVERS_SOLVING()
     -- LeverPuzzleSolved is deliberately NOT part of the no-levers test gate.
     return (tonumber(folder:GetAttribute("SolvedPuzzleCount")) or 0) < 3
 end
-local function __BEYY_CH2_NO_LEVERS_STOP(permanent)
-    __BEYY_CH2_NO_LEVERS_DISABLED = permanent == true
+local function __BEYY_CH2_NO_LEVERS_CLEANUP()
     local env = _G
     if type(getgenv) == "function" then
         local ok, result = pcall(getgenv)
@@ -238,19 +251,42 @@ local function __BEYY_CH2_NO_LEVERS_STOP(permanent)
     env.__BEYY_CH2_COMBO_PUZZLE_RUNNING = false
     env.__BEYY_CH2_HOLD_FOLLOW_SOLVER = nil
     env.__BEYY_CH2_HOLD_CAPTURE = nil
+end
+local function __BEYY_CH2_NO_LEVERS_STOP(permanent)
+    __BEYY_CH2_NO_LEVERS_DISABLED = __BEYY_CH2_NO_LEVERS_DISABLED or permanent == true
+    __BEYY_CH2_NO_LEVERS_WANTED = false
+    __BEYY_CH2_NO_LEVERS_GENERATION += 1
     __BEYY_CH2_NO_LEVERS_STARTED = false
+    __BEYY_CH2_NO_LEVERS_CLEANUP()
 end
 local function __BEYY_CH2_NO_LEVERS_START()
-    if __BEYY_CH2_NO_LEVERS_STARTED then return true end
-    if __BEYY_CH2_NO_LEVERS_DISABLED or __BEYY_CH2_NO_LEVERS_FAILED then return false end
+    if __BEYY_CH2_NO_LEVERS_DISABLED then return false end
+    __BEYY_CH2_NO_LEVERS_WANTED = true
+    __BEYY_CH2_NO_LEVERS_FAILED = false
+    -- A stopped HTTP/module startup must finish cleanup before a replacement starts.
+    if __BEYY_CH2_NO_LEVERS_STARTED or __BEYY_CH2_NO_LEVERS_LOADING then return true end
+    __BEYY_CH2_NO_LEVERS_GENERATION += 1
+    local generation = __BEYY_CH2_NO_LEVERS_GENERATION
+    local function cancelled()
+        return generation ~= __BEYY_CH2_NO_LEVERS_GENERATION
+            or not __BEYY_CH2_NO_LEVERS_WANTED or __BEYY_CH2_NO_LEVERS_DISABLED
+    end
     __BEYY_CH2_NO_LEVERS_STARTED = true
+    __BEYY_CH2_NO_LEVERS_LOADING = true
     task.spawn(function()
-        local ok,result=pcall(__BEYY_CH2_NO_LEVERS_RUN)
-        if not ok or result~=true then
+        local ok,result=pcall(__BEYY_CH2_NO_LEVERS_RUN,cancelled)
+        __BEYY_CH2_NO_LEVERS_LOADING = false
+        if cancelled() then
+            -- Catch stop hooks registered by a module that yielded during startup.
+            __BEYY_CH2_NO_LEVERS_CLEANUP()
+            if __BEYY_CH2_NO_LEVERS_WANTED and not __BEYY_CH2_NO_LEVERS_DISABLED then
+                __BEYY_CH2_NO_LEVERS_START()
+            end
+        elseif not ok or result~=true then
             __BEYY_CH2_NO_LEVERS_FAILED = true
-            __BEYY_CH2_NO_LEVERS_STARTED = false
             warn("[BeyyHub Chapter2] Integrated v33 failed to start: "..tostring(result))
             __BEYY_CH2_NO_LEVERS_STOP(false)
+            if __BEYY_CH2_NO_LEVERS_ON_FAILURE then __BEYY_CH2_NO_LEVERS_ON_FAILURE() end
         end
     end)
     print("[BeyyHub Chapter2] INTEGRATED v33: v32 puzzles, v6 invisible/deferred Skip, v9 instant hay return, v27 VacuumPower-only; key automation preserved")
@@ -399,7 +435,20 @@ if _G.__BEYY_HUB_LOADED then
     task.wait(0.5)
 end
 _G.__BEYY_HUB_LOADED = true
-__BEYY_CH2_NO_LEVERS_START()
+-- Preserve automatic startup unless the active config explicitly saved this toggle OFF.
+do
+    local enabled = true
+    local config = __beyyConfigDecode(__beyyInitialConfig)
+    local elements = config and (config.__elements or config)
+    local entry
+    if type(elements) == "table" then entry = elements.Chapter2AutoPuzzles end
+    if type(entry) == "table" and entry.__type == "Toggle" and type(entry.value) == "boolean" then
+        enabled = entry.value
+    elseif type(entry) == "boolean" then
+        enabled = entry
+    end
+    if enabled then __BEYY_CH2_NO_LEVERS_START() end
+end
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -2281,20 +2330,23 @@ do
             Title = "v32 Picture / Color / Number + instant hay return",
             Desc = "v6 invisible/deferred native intro Skip, v9 immediate return to spawn after 3/3, Vacuum Power-only v27. No lever requests; Main key pickup/hand-in remains.",
         })
-        puzzleTab:Button({
+        Registry.Chapter2AutoPuzzles = puzzleTab:Toggle({
             Title = "Auto Solve Puzzles",
-            Desc = "Starts integrated Chapter 2 v33 (4 modules) if not already running.",
-            Callback = function()
-                __BEYY_CH2_NO_LEVERS_START()
+            Value = __BEYY_CH2_NO_LEVERS_WANTED,
+            Desc = "Run Picture, Color and Number puzzles with coordinated intro Skip, return and Vacuum Power upgrades. Turn off to stop all four workers.",
+            Callback = function(enabled)
+                if hubUnloaded then return end
+                if enabled then
+                    __BEYY_CH2_NO_LEVERS_START()
+                else
+                    __BEYY_CH2_NO_LEVERS_STOP(false)
+                end
             end,
         })
-        puzzleTab:Button({
-            Title = "Stop Auto Solve Puzzles",
-            Desc = "Stops v33 puzzle, cutscene, return and upgrade workers and restores visuals.",
-            Callback = function()
-                __BEYY_CH2_NO_LEVERS_STOP()
-            end,
-        })
+        __BEYY_CH2_NO_LEVERS_ON_FAILURE = function()
+            local toggle = Registry.Chapter2AutoPuzzles
+            if not hubUnloaded and toggle and toggle.Value then toggle:Set(false) end
+        end
 
     do
         local overview = overviewTab
