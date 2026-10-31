@@ -1,5 +1,6 @@
 -- BeyyHub v103.00 | direct-branch loader with AFK replay recovery
--- Resolves the current revision and keeps validated AFK recovery caches.
+-- Sceneton fork loader v2 BRANCH-FIRST FALLBACK
+-- Try current main before an older recovery revision when the commits API is unavailable.
 local VERSION = "103.00"
 local BASE = "https://raw.githubusercontent.com/sceneton/needlehub/main/"
 local MODULES = {
@@ -36,9 +37,12 @@ end
 local revisionPath=CACHE_FOLDER.."/afk_replay_revision_v103_sceneton.txt"
 if validRevision(selectedRevision) then
     if type(writefile)=="function" then pcall(writefile,revisionPath,selectedRevision) end
-elseif type(readfile)=="function" then
+end
+if not validRevision(selectedRevision)then selectedRevision=nil end
+local cachedRevision
+if type(readfile)=="function"then
     local ok,value=pcall(readfile,revisionPath)
-    selectedRevision=ok and validRevision(value) and value or nil
+    cachedRevision=ok and validRevision(value)and value or nil
 end
 local DOWNLOAD_BASE=validRevision(selectedRevision)
     and ("https://raw.githubusercontent.com/sceneton/needlehub/"..selectedRevision.."/") or BASE
@@ -64,6 +68,10 @@ local function validate(source)
         lastModuleFailure = "Chapter1 replay recovery marker missing"
         return nil
     end
+    if target.name=="Chapter2"and not source:find("Sceneton Chapter2 revision-aware workers v1",1,true)then
+        lastModuleFailure="Chapter2 predates matching-worker loader support"
+        return nil
+    end
     local started = os.clock()
     local ok, fn, compileError = pcall(loadstring, source)
     compileSeconds += os.clock() - started
@@ -75,25 +83,37 @@ local function validate(source)
     return fn
 end
 
-local fn
-for attempt = 1, 3 do
-    local ok, source = pcall(fetch, DOWNLOAD_BASE .. target.file)
-    if ok then
-        fn = validate(source)
-        if fn then
-            if moduleCache and type(writefile)=="function" then pcall(writefile,moduleCache,source) end
-            break
-        end
-    else
-        lastModuleFailure = "download error: "..tostring(source)
+local fn,activeRevision
+local sourceLabel="unavailable"
+local function download(base,revision,attempts,label)
+    for attempt=1,attempts do
+        local ok,source=pcall(fetch,base..target.file)
+        if ok then
+            fn=validate(source)
+            if fn then
+                activeRevision=revision;DOWNLOAD_BASE=base;sourceLabel=label
+                if moduleCache and type(writefile)=="function"then pcall(writefile,moduleCache,source)end
+                return true
+            end
+        else lastModuleFailure="download error: "..tostring(source)end
+        if attempt<attempts then task.wait(0.25*attempt)end
     end
-    if attempt < 3 then task.wait(0.25 * attempt) end
+    return false
 end
+if selectedRevision then download(DOWNLOAD_BASE,selectedRevision,2,"resolved revision")end
+if not fn then download(BASE,nil,3,"current main branch")end
+if not fn and cachedRevision and cachedRevision~=selectedRevision then
+    download("https://raw.githubusercontent.com/sceneton/needlehub/"..cachedRevision.."/",cachedRevision,1,"recovery revision")
+end
+if fn and type(writefile)=="function"then pcall(writefile,revisionPath,activeRevision or "")end
 if not fn and moduleCache and type(readfile)=="function" then
     local ok,cached=pcall(readfile,moduleCache)
     if ok then
         fn=validate(cached)
-        if fn then warn("[BeyyHub] Online AFK module unavailable; using the last validated recovery cache") end
+        if fn then
+            activeRevision=nil;sourceLabel="validated AFK cache"
+            warn("[BeyyHub] Online AFK module unavailable; using the last validated recovery cache")
+        end
     end
 end
 if not fn then
@@ -124,11 +144,13 @@ if type(writefile)=="function" then
     local cached
     if type(readfile)=="function" then local ok,value=pcall(readfile,LOADER_CACHE);if ok then cached=value end end
     local validCache=type(cached)=="string" and cached:find("https://raw.githubusercontent.com/sceneton/needlehub/",1,true)
+        and cached:find("Sceneton fork loader v2 BRANCH-FIRST FALLBACK",1,true)
         and cached:find("afk_replay_loader_v103.lua",1,true)
         and cached:find('local VERSION = "'..VERSION..'"',1,true) and loadstring(cached)
     if not validCache then
         local ok,value=pcall(fetch,DOWNLOAD_BASE.."loader.lua")
         if ok and type(value)=="string" and value:find("https://raw.githubusercontent.com/sceneton/needlehub/",1,true)
+            and value:find("Sceneton fork loader v2 BRANCH-FIRST FALLBACK",1,true)
             and value:find("afk_replay_loader_v103.lua",1,true)
             and value:find('local VERSION = "'..VERSION..'"',1,true) and loadstring(value) then
             pcall(writefile,LOADER_CACHE,value)
@@ -160,6 +182,7 @@ if queue and _G.__BEYY_SCENETON_NEEDLEHUB_RELOAD_JOB~=game.JobId then
                 return game:HttpGet(url.."?refresh="..tostring(os.time()).."-"..tostring(math.random(1,1000000000)))
             end)
             if ok and type(source)=="string" and source:find("https://raw.githubusercontent.com/sceneton/needlehub/",1,true)
+                and source:find("Sceneton fork loader v2 BRANCH-FIRST FALLBACK",1,true)
                 and source:find('local VERSION = "103.00"',1,true)
                 and source:find("afk_replay_loader_v103.lua",1,true) and loadstring(source) then body=source;break end
             if attempt<3 then task.wait(attempt*0.5) end
@@ -168,7 +191,8 @@ if queue and _G.__BEYY_SCENETON_NEEDLEHUB_RELOAD_JOB~=game.JobId then
             local ok,cached=pcall(readfile,"BeyyHub/afk_replay_loader_v103.lua")
             if ok and type(cached)=="string" and cached:find("https://raw.githubusercontent.com/sceneton/needlehub/",1,true)
                 and cached:find('local VERSION = "103.00"',1,true)
-                and cached:find("afk_replay_loader_v103.lua",1,true) and loadstring(cached) then body=cached end
+                and cached:find("Sceneton fork loader v2 BRANCH-FIRST FALLBACK",1,true)
+        and cached:find("afk_replay_loader_v103.lua",1,true) and loadstring(cached) then body=cached end
         end
         if not body then warn("[BeyyHub] No validated online or cached AFK router; reattach and rerun the loader");return end
         if type(writefile)=="function" then pcall(writefile,"BeyyHub/afk_replay_loader_v103.lua",body) end
@@ -189,7 +213,8 @@ end
 print(string.format("[BeyyHub Fast Startup] %s source=revision-or-cache requests=%d compile=%.3fs loader=%.2fs",
     target.name, requests, compileSeconds, os.clock() - begin))
 local moduleBegin = os.clock()
-local ok, err = pcall(fn)
+print("[BeyyHub Fork Loader] Source: "..sourceLabel.." | Revision: "..tostring(activeRevision or "main"))
+local ok, err = pcall(fn,activeRevision)
 if not ok then warn("[BeyyHub] " .. target.name .. " error: " .. tostring(err)) end
 print(string.format("[BeyyHub Fast Startup] %s module returned after %.2fs (module=%.2fs)",
     target.name, os.clock() - begin, os.clock() - moduleBegin))
