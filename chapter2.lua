@@ -11,7 +11,7 @@ end
 -- Chapter 2 integrated v33. This is the SAME four-module launcher as
 -- chapter2-no-levers-cutscene-test.lua, embedded without an extra HTTP fetch.
 -- Replaces the legacy 2,000-line v23 puzzle/cutscene controller entirely.
-local __BEYY_CH2_NO_LEVERS_RUN = function(cancelled)
+local __BEYY_CH2_NO_LEVERS_RUN = function(cancelled,cutsceneOnly)
     cancelled = cancelled or function() return false end
 -- Beyy Chapter 2 Standalone Integrated v33 (v32 puzzles / v6 invisible Skip / v9 return / v27 VacuumPower)
 -- Canonical Chapter 2 standalone entry point; replaces legacy v26 workflow.
@@ -26,7 +26,7 @@ local Players=game:GetService("Players")
 local paths={
     {name="CUTSCENE",file="chapter2-cutscene-deferred-invisible-skip-test.lua",
         marker="Beyy Chapter 2 Cutscene-Only Standalone v6 INVISIBLE DEFERRED SKIP TEST",
-        cache="BeyyHub/chapter2_integrated_v33_cutscene_v6_cinefix1.lua"},
+        cache="BeyyHub/chapter2_fork_independent_cutscene_v6_cinefix3.lua"},
     {name="HOLD",file="chapter2-puzzle-position-diagnostic.lua",
         marker="Beyy Chapter 2 Teleport-Hold and Return Diagnostic v9",
         cache="BeyyHub/chapter2_integrated_v33_return_v9_jumpfix.lua"},
@@ -163,6 +163,8 @@ local function launch(item)
     log(item.name.." started ("..source..")")
     return true
 end
+-- The bypass toggle can launch its visual/controller module without any puzzle workers.
+if cutsceneOnly then return launch(paths[1]) end
 -- Capture the genuine Chapter2 start before any controller moves our
 -- character. Preserve its full CFrame, including facing direction.
 local env=_G
@@ -192,8 +194,7 @@ end
 env.__BEYY_CH2_HOLD_FOLLOW_SOLVER=true
 log("INTEGRATED v33: v32 puzzles / v6 invisible deferred Skip / v9 instant return / v27 VacuumPower ONLY")
 log("Loading: cutscene v6 INVISIBLE DEFERRED INTRO -> return v9 -> v32 unchanged solver -> Vacuum Power")
-local okCutscene=launch(paths[1])
-if cancelled() then return false end
+-- The independently saved bypass toggle owns CUTSCENE.
 local okHold=launch(paths[2])
 if cancelled() then return false end
 -- Do NOT wait 1.2s or force the diagnostic's 4/5 point. The existing
@@ -202,15 +203,14 @@ local okPuzzle=launch(paths[3])
 if cancelled() then return false end
 local okUpgrade=launch(paths[4])
 if cancelled() then return false end
-if not okCutscene or not okHold or not okPuzzle or not okUpgrade then
-    fail("Partial startup: cutscene="..tostring(okCutscene)..
-        " hold="..tostring(okHold)..
+if not okHold or not okPuzzle or not okUpgrade then
+    fail("Partial puzzle startup: hold="..tostring(okHold)..
         " puzzle="..tostring(okPuzzle)..
         " upgrades="..tostring(okUpgrade)..
         ". Check console for exact module error.")
     return false
 else
-    log("Four modules running: v32 native puzzles, visually hidden deferred intro Skip v6, v9 instant return, VacuumPower.")
+    log("Puzzle workers running: v32 native puzzles, v9 instant return, VacuumPower; bypass is independently controlled.")
     log("3/3: IMMEDIATE return to saved spawn even during cutscene; room snapback correction stays active.")
     log("F8: combined puzzle/hidden Skip/upgrade report; F9: return report; F12: cancel hold.")
 end
@@ -236,13 +236,10 @@ local function __BEYY_CH2_NO_LEVERS_CLEANUP()
         local ok, result = pcall(getgenv)
         if ok and type(result) == "table" then env = result end
     end
-    -- The latest Chapter2 controller owns FOUR modules, not one.
-    -- Stop in reverse startup order to avoid a surviving cutscene/HOLD
-    -- worker trying to relocate the character after the hub is unloaded.
+    -- Puzzle cleanup must not stop the independently enabled cutscene controller.
     for _, key in ipairs({
         "__BEYY_CH2_COMBO_STOP",
         "__BEYY_CH2_SPOT_STOP",
-        "__BEYY_CH2_CUTSCENE_ONLY_STOP",
         "__BEYY_CH2_AUTO_UPGRADES_STOP",
     }) do
         local stop = env[key]
@@ -290,6 +287,47 @@ local function __BEYY_CH2_NO_LEVERS_START()
         end
     end)
     print("[BeyyHub Chapter2] INTEGRATED v33: v32 puzzles, v6 invisible/deferred Skip, v9 instant hay return, v27 VacuumPower-only; key automation preserved")
+    return true
+end
+-- Independent cutscene switch: a saved bypass ON works even with puzzles OFF.
+local __BEYY_CH2_CUTSCENE = {Wanted=false,Started=false,Loading=false,Disabled=false,Generation=0}
+function __BEYY_CH2_CUTSCENE:Cleanup()
+    local env=_G
+    if type(getgenv)=="function" then
+        local ok,value=pcall(getgenv)
+        if ok and type(value)=="table" then env=value end
+    end
+    local stop=env.__BEYY_CH2_CUTSCENE_ONLY_STOP
+    if type(stop)=="function" then pcall(stop,"BeyyHub cutscene bypass disabled") end
+end
+function __BEYY_CH2_CUTSCENE:Set(enabled,permanent)
+    if not enabled then
+        self.Disabled=self.Disabled or permanent==true
+        self.Wanted=false;self.Started=false;self.Generation+=1
+        self:Cleanup()
+        return true
+    end
+    if self.Disabled then return false end
+    self.Wanted=true
+    if self.Started or self.Loading then return true end
+    self.Generation+=1
+    local generation=self.Generation
+    local function cancelled()
+        return generation~=self.Generation or not self.Wanted or self.Disabled
+    end
+    self.Started=true;self.Loading=true
+    task.spawn(function()
+        local ok,result=pcall(__BEYY_CH2_NO_LEVERS_RUN,cancelled,true)
+        self.Loading=false
+        if cancelled() then
+            self:Cleanup()
+            if self.Wanted and not self.Disabled then self:Set(true) end
+        elseif not ok or result~=true then
+            warn("[BeyyHub Chapter2] Cutscene controller failed: "..tostring(result))
+            self:Set(false)
+            if self.OnFailure then self.OnFailure() end
+        end
+    end)
     return true
 end
 -- Start only AFTER previous hub session cleanup, otherwise its cleanup
@@ -435,19 +473,19 @@ if _G.__BEYY_HUB_LOADED then
     task.wait(0.5)
 end
 _G.__BEYY_HUB_LOADED = true
--- Preserve automatic startup unless the active config explicitly saved this toggle OFF.
+-- Restore each preference before any controller starts. Defaults preserve auto startup.
 do
-    local enabled = true
-    local config = __beyyConfigDecode(__beyyInitialConfig)
-    local elements = config and (config.__elements or config)
-    local entry
-    if type(elements) == "table" then entry = elements.Chapter2AutoPuzzles end
-    if type(entry) == "table" and entry.__type == "Toggle" and type(entry.value) == "boolean" then
-        enabled = entry.value
-    elseif type(entry) == "boolean" then
-        enabled = entry
+    local config=__beyyConfigDecode(__beyyInitialConfig)
+    local elements=config and(config.__elements or config)
+    local function enabled(key)
+        local entry
+        if type(elements)=="table" then entry=elements[key] end
+        if type(entry)=="table" and entry.__type=="Toggle" and type(entry.value)=="boolean" then return entry.value end
+        if type(entry)=="boolean" then return entry end
+        return true
     end
-    if enabled then __BEYY_CH2_NO_LEVERS_START() end
+    if enabled("CutsceneBypass") then __BEYY_CH2_CUTSCENE:Set(true) end
+    if enabled("Chapter2AutoPuzzles") then __BEYY_CH2_NO_LEVERS_START() end
 end
 
 local Players = game:GetService("Players")
@@ -508,6 +546,7 @@ do
     _G.__BEYY_HUB_CLEANUP = function()
         hubUnloaded = true
         __BEYY_CH2_NO_LEVERS_STOP(true)
+        __BEYY_CH2_CUTSCENE:Set(false,true)
         beyyAntiAfkConnection:Disconnect()
         if hubRestoreAction then pcall(hubRestoreAction) end
         if hubCursorCleanup then pcall(hubCursorCleanup) end
@@ -2333,7 +2372,7 @@ do
         Registry.Chapter2AutoPuzzles = puzzleTab:Toggle({
             Title = "Auto Solve Puzzles",
             Value = __BEYY_CH2_NO_LEVERS_WANTED,
-            Desc = "Run Picture, Color and Number puzzles with coordinated intro Skip, return and Vacuum Power upgrades. Turn off to stop all four workers.",
+            Desc = "Run Picture, Color and Number puzzles, return and Vacuum Power upgrades. Cutscene handling follows the separate Unskippable Cutscene Bypass toggle.",
             Callback = function(enabled)
                 if hubUnloaded then return end
                 if enabled then
@@ -3181,127 +3220,31 @@ end
 
     overview:Section({ Title = "Cutscenes" })
     Registry.CutsceneBypass = overview:Toggle({
-        Title = "Unskippable Cutscene Bypass", Value = false,
-        Desc = "Auto ON after all three levers; OFF BEFORE needle hand-in. No effect on the server's timer.",
+        Title = "Unskippable Cutscene Bypass", Value = __BEYY_CH2_CUTSCENE.Wanted,
+        Desc = "Hide the opening black screen, handle native intro Skip and bypass non-final cinematics. Independent of Auto Solve Puzzles; final endings stay protected.",
         Callback = function(enabled)
-            if enabled then
-                if __BEYY_CH2_NO_LEVERS_STARTED then
-                    print("[BeyyHub Cutscene] Integrated v33 owns non-final camera; duplicate bypass suppressed")
-                    task.defer(function()
-                        if Registry.CutsceneBypass and Registry.CutsceneBypass.Value == true then
-                            Registry.CutsceneBypass:Set(false)
-                        end
-                    end)
-                    return
-                end
-                if finalEndingProtected then
-                    task.defer(function()
-                        local toggle = Registry.CutsceneBypass
-                        if toggle and toggle.Value == true then toggle:Set(false) end
-                    end)
-                    return
-                end
-                if not launchCutsceneBypass() then warn("[BeyyHub] Cutscene bypass could not start") end
-            else shutdownCutsceneBypass() end
+            if not hubUnloaded then __BEYY_CH2_CUTSCENE:Set(enabled) end
         end,
     })
-
-    -- Run this small cutscene-cycle setup in its own Luau function scope.
-    -- It had exceeded the enclosing Chapter2 function's 200-local limit.
-    -- Synchronous call preserves all toggles, listeners and callbacks.
-    do
-        (function()
-    local autoBypassCycleActive = false
-    local ownedNeedleDuringCycle = LocalPlayer:GetAttribute("NeedleOwned") == true
-    local needleOwnedPrevious = ownedNeedleDuringCycle
-
-    autoCutsceneEnableAfterLevers = function(reason)
-        if __BEYY_CH2_NO_LEVERS_STARTED then return end
-        -- The coordinated solver has just confirmed all three levers.
-        -- Do not let a prematurely replicated release flag suppress it.
-        -- Generic CutsceneActive listeners are guarded separately.
-        if hubUnloaded or autoBypassCycleActive or finalEndingProtected
-            or postPuzzleKeyPriority
-            or LocalPlayer:GetAttribute("NeedleOwned") == true
-            or cutsceneResultsVisible() then return end
-        leverBypassUntil = math.max(leverBypassUntil, os.clock() + 6.5)
-        print("[BeyyHub Cutscene] Lever bypass grace started (6.5s); " .. tostring(reason))
-        local toggle = Registry.CutsceneBypass
-        if not toggle then return end
-        if toggle.Value ~= true then toggle:Set(true) end
-        if toggle.Value == true and type(cutsceneBypassStop) == "function" then
-            autoBypassCycleActive = true
-            ownedNeedleDuringCycle = LocalPlayer:GetAttribute("NeedleOwned") == true
-            if cutsceneBypassRefresh then
-                local okRefresh, refreshErr = pcall(cutsceneBypassRefresh)
-                if not okRefresh then warn("[BeyyHub Cutscene] Lever activation refresh: "..tostring(refreshErr)) end
-            end
-            print("[BeyyHub Cutscene] AUTO ON after " .. tostring(reason))
-        else
-            warn("[BeyyHub Cutscene] Auto-enable failed; manual toggle remains available")
-            if toggle.Value == true then toggle:Set(false) end
-        end
+    __BEYY_CH2_CUTSCENE.OnFailure=function()
+        local toggle=Registry.CutsceneBypass
+        if not hubUnloaded and toggle and toggle.Value then toggle:Set(false) end
     end
 
+    -- Ending protection changes controller activity, never the user's saved toggle.
+    autoCutsceneEnableAfterLevers = function() end
     autoCutsceneDisableAfterHandIn = function(reason)
-        if hubUnloaded then return end
-        finalEndingProtected = true
-        leverBypassUntil = 0
-        puzzleBypassUntil = 0
-        local wasActive = autoBypassCycleActive
-        autoBypassCycleActive = false
-        ownedNeedleDuringCycle = false
-        local toggle = Registry.CutsceneBypass
-        if toggle and toggle.Value == true then toggle:Set(false)
-        else shutdownCutsceneBypass() end
-        print("[BeyyHub Cutscene] Final ending protected; bypass OFF after " ..
-            tostring(reason) .. (wasActive and " (automatic cycle)" or ""))
+        finalEndingProtected=true
+        leverBypassUntil,puzzleBypassUntil=0,0
+        shutdownCutsceneBypass()
+        print("[BeyyHub Cutscene] Final ending protected: "..tostring(reason))
     end
-
-    table.insert(autoCutsceneSignals, LocalPlayer:GetAttributeChangedSignal("Chapter2ReleaseActive"):Connect(function()
-        if LocalPlayer:GetAttribute("Chapter2ReleaseActive") == true
-            and not finalEndingProtected and LocalPlayer:GetAttribute("NeedleOwned") ~= true then
-            puzzleReleaseObserved = true
-            puzzleBypassUntil = math.max(puzzleBypassUntil, os.clock() + 6.5)
-            print("[BeyyHub Cutscene] Puzzle-release flag observed; bypass grace 6.5s (final ending excluded)")
-        end
-    end))
-    table.insert(autoCutsceneSignals, LocalPlayer:GetAttributeChangedSignal("CutsceneActive"):Connect(function()
-        if __BEYY_CH2_NO_LEVERS_STARTED then return end
-        if hubUnloaded or leverRunning or autoBypassCycleActive or finalEndingProtected
-            or postPuzzleKeyPriority or puzzleReleaseObserved
-            or LocalPlayer:GetAttribute("NeedleOwned") == true
-            or cutsceneResultsVisible() then return end
-        if LocalPlayer:GetAttribute("CutsceneActive") == true
-            and LocalPlayer:GetAttribute("IntroCutsceneFinished") == true
-            and LocalPlayer:GetAttribute("Chapter2ReleaseActive") ~= true
-            and leverFolder() then
-            autoCutsceneEnableAfterLevers("post-lever cutscene (manual levers)")
+    table.insert(autoCutsceneSignals,LocalPlayer:GetAttributeChangedSignal("NeedleRoundComplete"):Connect(function()
+        if LocalPlayer:GetAttribute("NeedleRoundComplete")==true then
+            autoCutsceneDisableAfterHandIn("round complete")
         end
     end))
 
-    table.insert(autoCutsceneSignals, LocalPlayer:GetAttributeChangedSignal("NeedleOwned"):Connect(function()
-        if hubUnloaded then return end
-        local owned = LocalPlayer:GetAttribute("NeedleOwned") == true
-        if autoBypassCycleActive then
-            if owned then
-                ownedNeedleDuringCycle = true
-            elseif needleOwnedPrevious and ownedNeedleDuringCycle then
-                local laser = Workspace:FindFirstChild("Laser")
-                local root = farmRoot()
-                local nearHandIn = laser and laser:IsA("Model") and root
-                    and (root.Position - laser:GetPivot().Position).Magnitude <= 30
-                if nearHandIn or cutsceneResultsVisible()
-                    or LocalPlayer:GetAttribute("Chapter2ReleaseActive") == true then
-                    finalEndingProtected = true
-                    autoCutsceneDisableAfterHandIn("needle ownership cleared at hand-in")
-                end
-            end
-        end
-        needleOwnedPrevious = owned
-    end))
-        end)()
-    end
     end
 
     do
