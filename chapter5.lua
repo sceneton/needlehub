@@ -967,7 +967,7 @@ local function createTabletPickup(options)
             tripCharacter,tripRoot=char,root
             home=home or root.CFrame
             status("Picking up "..target.Name)
-            if distance>math.max(1,prompt.MaxActivationDistance-2)then
+            if distance>math.max(1,prompt.MaxActivationDistance-0.5)then
                 local pose=options.Approach(position(prompt),root,hum,folder,prompt.MaxActivationDistance)
                 assert(pose,"No floor-supported position beside "..target.Name)
                 move(pose);pause(0.15)
@@ -1994,15 +1994,17 @@ end
                 end
                 params.FilterDescendantsInstances=exclude
                 local best,score
-                for i=0,11 do
-                    local angle=i*math.pi/6
-                    local start=target+Vector3.new(math.cos(angle)*4,8,math.sin(angle)*4)
-                    local hit=Workspace:Raycast(start,Vector3.new(0,-40,0),params)
-                    if hit and hit.Normal.Y>=0.8 then
-                        local point=hit.Position+Vector3.new(0,hum.HipHeight+root.Size.Y/2,0)
-                        local distance=(point-root.Position).Magnitude
-                        if(point-target).Magnitude<=math.max(1,range-2)and math.abs(point.Y-root.Position.Y)<10
-                            and(not score or distance<score)then best,score=point,distance end
+                for _,radius in ipairs({1.5,3,4,6})do
+                    for i=0,11 do
+                        local angle=i*math.pi/6
+                        local start=target+Vector3.new(math.cos(angle)*radius,8,math.sin(angle)*radius)
+                        local hit=Workspace:Raycast(start,Vector3.new(0,-40,0),params)
+                        if hit and hit.Normal.Y>=0.8 then
+                            local point=hit.Position+Vector3.new(0,hum.HipHeight+root.Size.Y/2,0)
+                            local distance=(point-root.Position).Magnitude
+                            if(point-target).Magnitude<=math.max(1,range-0.5)and math.abs(point.Y-root.Position.Y)<10
+                                and(not score or distance<score)then best,score=point,distance end
+                        end
                     end
                 end
                 return best and(CFrame.new(best)*root.CFrame.Rotation)or nil
