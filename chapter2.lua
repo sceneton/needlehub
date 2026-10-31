@@ -2224,24 +2224,22 @@ do
             if selected==0 then status("No cash upgrades enabled"); return end
             if #available==0 and not earlyTnt and not lateTnt then status("Selected cash upgrades are maxed or unavailable"); return end
             local target
-            if earlyTnt then
-                if cash<earlyTnt.Cost then waitKey="upgrades-cash";status(string.format("Saving for TntCooldown: $%.2f / $%.2f",cash,earlyTnt.Cost)); return end
+            if earlyTnt and cash>=earlyTnt.Cost then
                 target=earlyTnt
-            elseif power then
-                if cash<power.Cost then waitKey="upgrades-cash";status(string.format("Saving for VacuumPower: $%.2f / $%.2f",cash,power.Cost)); return end
+            elseif power and cash>=power.Cost then
                 target=power
-            elseif vacuum and cash>=vacuum.Cost*0.75 then
-                if cash<vacuum.Cost then waitKey="upgrades-cash";status(string.format("Saving for %s: $%.2f / $%.2f",vacuum.Name,cash,vacuum.Cost)); return end
+            elseif vacuum and cash>=vacuum.Cost then
                 target=vacuum
             else
+                -- Keep priority among affordable tracks without blocking cheaper upgrades.
                 for _,entry in ipairs(available) do if cash>=entry.Cost then target=entry;break end end
-                -- Remaining TNT speed levels wait until all other enabled tracks finish.
-                if #available==0 and lateTnt and cash>=lateTnt.Cost then target=lateTnt end
+                if not target and lateTnt and cash>=lateTnt.Cost then target=lateTnt end
             end
             if not target then
                 waitKey="upgrades-cash"
-                local cheapest=available[1] or lateTnt
+                local cheapest=earlyTnt or available[1] or lateTnt
                 for _,entry in ipairs(available) do if entry.Cost<cheapest.Cost then cheapest=entry end end
+                if lateTnt and lateTnt.Cost<cheapest.Cost then cheapest=lateTnt end
                 status(string.format("Waiting for cash: $%.2f / $%.2f (%s)",cash,cheapest.Cost,cheapest.Name)); return
             end
             idle=false
