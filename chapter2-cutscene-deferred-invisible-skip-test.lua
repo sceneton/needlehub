@@ -1,5 +1,5 @@
 -- Beyy Chapter 2 Cutscene-Only Standalone v6 INVISIBLE DEFERRED SKIP TEST
--- Beyy Chapter 2 Indexed Cutscene Visuals v1
+-- Beyy Chapter 2 Indexed Cutscene Visuals v2 PRESERVE LOCATION
 -- Intro: defer native Skip until puzzles finish, visually mask Skip GUI while keeping its native click enabled.
 -- Non-final lever/puzzle cinematics: local camera/input/overlay recovery only.
 -- No puzzle or lever actions, hay teleport, progression remotes, or final-ending bypass.
@@ -165,6 +165,73 @@ local function endingProtected()
     end
     return node==ending
 end
+-- Preserve the latest pose across bounded native intro/release resets to spawn.
+local function createIntroLocationPreserver(options)
+    local api={Corrections=0,Reason="Waiting for intro character"}
+    local alive,root,spawnPose,lastPose,lastVelocity=true,nil,nil,nil,nil
+    local pending,pendingVelocity,started,confirmedAt,releaseClearedAt
+    local releaseSeen=false
+    local lastCorrection=-math.huge
+    local function note(message)
+        api.Reason=message
+        if options.Log then options.Log(message)end
+    end
+    function api.Stop(reason)
+        alive=false;root=nil;spawnPose=nil;lastPose=nil;lastVelocity=nil;pending=nil;pendingVelocity=nil
+        api.Reason=reason or "Stopped"
+    end
+    function api.Step()
+        if not alive then return end
+        local player=options.Player()
+        if not player then return end
+        if options.Protected()then api.Stop("Final/key ending protected");return end
+        local char=player.Character
+        local current=char and char:FindFirstChild("HumanoidRootPart")
+        local hum=char and char:FindFirstChildOfClass("Humanoid")
+        local done=player:GetAttribute("IntroCutsceneFinished")==true
+        local release=player:GetAttribute("Chapter2ReleaseActive")==true
+        local now=options.Now()
+        if not root then
+            if done then api.Stop("Intro already finished when controller loaded");return end
+            if not current or not hum or hum.Health<=0 then return end
+            root=current;spawnPose=root.CFrame;lastPose=root.CFrame;lastVelocity=root.AssemblyLinearVelocity;started=now
+            note("Tracking current position through intro; no return-to-spawn target")
+            return
+        end
+        if current~=root or not hum or hum.Health<=0 then api.Stop("Character changed or died");return end
+        if now-started>45 then api.Stop("Transition safety timeout");return end
+        if done and not confirmedAt then confirmedAt=now end
+        if release then releaseSeen=true;releaseClearedAt=nil
+        elseif releaseSeen then releaseClearedAt=releaseClearedAt or now end
+        if done and not release and now-(releaseClearedAt or confirmedAt)>=2 then
+            api.Stop("Intro/release finished plus 2s grace");return
+        end
+        local nearSpawn=(root.Position-spawnPose.Position).Magnitude<8
+        if pending and not nearSpawn then pending=nil;pendingVelocity=nil end
+        if not pending and nearSpawn and(root.Position-lastPose.Position).Magnitude>20
+            and(lastPose.Position-spawnPose.Position).Magnitude>12 then
+            pending=lastPose;pendingVelocity=lastVelocity
+        end
+        if pending then
+            -- Never force an anchored cinematic or repeatedly fight server movement.
+            if not root.Anchored and now-lastCorrection>=0.25 then
+                local distance=(root.Position-pending.Position).Magnitude
+                root.CFrame=pending
+                if pendingVelocity then root.AssemblyLinearVelocity=pendingVelocity end
+                api.Corrections+=1;lastCorrection=now
+                note(string.format("Preserved latest location after %.1f-stud native spawn reset (#%d)",distance,api.Corrections))
+                lastPose=root.CFrame;lastVelocity=root.AssemblyLinearVelocity
+                pending=nil;pendingVelocity=nil
+                if api.Corrections>=2 then api.Stop("Two reset corrections completed");return end
+            end
+            return
+        end
+        lastPose=root.CFrame;lastVelocity=root.AssemblyLinearVelocity
+    end
+    return api
+end
+local locationPreserver=createIntroLocationPreserver({Player=function()return player end,Now=os.clock,
+    Protected=endingProtected,Log=function(message)emit("POSITION",message)end})
 local function nativeIntroSkip()
     if not player or endingProtected()
         or player:GetAttribute("IntroCutsceneFinished")==true then return nil end
@@ -271,6 +338,12 @@ end
 -- Capture both direction and zoom; the previous handoff silently changed
 -- a 4-stud third-person intro view into the bypass's 0.6-stud first-person default.
 local function captureIntroView()
+    if introCameraActive or introBridgeActive then
+        local cp=math.cos(pitch)
+        introHandoffLook=Vector3.new(math.sin(yaw)*cp,math.sin(pitch),math.cos(yaw)*cp)
+        introHandoffDistance=math.clamp(cameraDistance,0.5,12)
+        return
+    end
     local cam=Workspace.CurrentCamera
     if not cam then return end
     introHandoffLook=cam.CFrame.LookVector
@@ -287,9 +360,9 @@ local function clickIntroSkip(button)
     if not alive or not button or not nativeIntroSkip() then return end
     -- Release pre-Skip camera mouse lock before synthetic GUI input.
     if introCameraActive then
+        captureIntroView()
         introCameraActive=false
         introCameraReleased=true
-        captureIntroView()
         introBridgeActive=true
         introBridgeStartedAt=os.clock()
         -- Keep Scriptable camera pointed at the player until the release
@@ -459,6 +532,7 @@ local function finishIntroCamera(reason)
     emit("CAMERA","Pre-Skip camera released: "..tostring(reason))
 end
 local function driveCamera()
+    if alive then locationPreserver.Step()end
     if not alive or endingProtected() or
         (not introCameraActive and not introBridgeActive) then return end
     if introBridgeActive and (bypassActive or os.clock()-introBridgeStartedAt>2.5) then
@@ -726,6 +800,7 @@ local function launchCutsceneBypass()
             return math.max(lo, math.min(hi, v))
         end
         local function setupPlayableCamera()
+            local hasIntroView=introHandoffLook~=nil or introHandoffDistance~=nil
             local rt = root()
             local facing = rt and rt.CFrame.LookVector or Vector3.new(0,0,-1)
             local planar = Vector3.new(facing.X, 0, facing.Z)
@@ -746,7 +821,8 @@ local function launchCutsceneBypass()
                 normalFirstPerson=introHandoffDistance<2.5
                 introHandoffDistance=nil
             end
-            cameraFirstPerson = normalFirstPerson or player.CameraMode == Enum.CameraMode.LockFirstPerson
+            if hasIntroView then cameraFirstPerson=normalFirstPerson
+            else cameraFirstPerson=normalFirstPerson or player.CameraMode==Enum.CameraMode.LockFirstPerson end
             distance = clamp(lastNormalDistance or 0.6, 0.0, 22)
             log(string.format("Normal camera calibration: %s d=%.2f pitch=%.2f (no forced 6+ stud zoom)",
                 cameraFirstPerson and "FIRST PERSON" or "THIRD PERSON", distance, pitch))
@@ -1572,7 +1648,9 @@ end
 local function report()
     local list={
         "CHAPTER 2 CUTSCENE-ONLY STANDALONE v6 INVISIBLE DEFERRED SKIP TEST",
-        "No lever/puzzle/needle remotes sent. No teleport performed.",
+        "No lever/puzzle/needle remotes sent. Only bounded native spawn-reset corrections; no automatic return to spawn.",
+        "Location preservation corrections: "..tostring(locationPreserver.Corrections),
+        "Location preservation state: "..tostring(locationPreserver.Reason),
         "Intro Skip attempts: "..tostring(introClicks),
         "Intro Skip first visible: "..tostring(firstSkipVisibleAt),
         "Intro Skip clicked at: "..tostring(skipClickedAt),
@@ -1626,6 +1704,7 @@ stop=function(reason)
     if not alive then return end
     stopReason=tostring(reason or "manual stop")
     alive=false
+    locationPreserver.Stop("Controller stopped")
     restoreIntroSkipArtwork()
     endPuzzleNoclip("standalone stopped")
     if cutsceneBypassStop then
