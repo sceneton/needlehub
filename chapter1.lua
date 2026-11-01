@@ -1009,6 +1009,93 @@ local function findClosestGemCached()
     return best, bestId
 end
 
+do
+    (function()
+        -- A single per-client owner coordinates the existing pickup and hand-in routines.
+        local env=type(getgenv)=="function"and getgenv()or _G
+        local function candidates()
+            if type(getconnections)~="function"or type(debug.getconstants)~="function"or type(debug.getupvalues)~="function"then return{}end
+            local list={}
+            for _,connection in ipairs(getconnections(RunService.Heartbeat))do
+                local fn=connection.Function
+                if type(fn)=="function"then
+                    local ok,constants=pcall(debug.getconstants,fn)
+                    if ok then
+                        local owned,farmer,enabled=false,false,false
+                        for _,value in pairs(constants)do
+                            if value=="NeedleOwned"then owned=true elseif value=="Farmer_NPC"then farmer=true elseif value=="AutoHandInNeedle"then enabled=true end
+                        end
+                        if owned and farmer and enabled then
+                            local valid,uv=pcall(debug.getupvalues,fn)
+                            if valid then
+                                local remote,state=false,nil
+                                for _,value in pairs(uv)do
+                                    if value==NeedleHandIn then remote=true end
+                                    if type(value)=="table"and type(rawget(value,"AutoPickupNeedle"))=="boolean"
+                                        and type(rawget(value,"AutoHandInNeedle"))=="boolean"
+                                        and type(rawget(value,"AutoFarmWins"))=="boolean"
+                                        and type(rawget(value,"AutoFarmHay"))=="boolean"
+                                        and type(rawget(value,"NeedleInterval"))=="number"then state=value end
+                                end
+                                if remote and state then list[#list+1]={Function=fn,State=state,Verified=true,
+                                    Disconnect=function()connection:Disconnect()end}end
+                            end
+                        end
+                    end
+                end
+            end
+            return list
+        end
+local function createNeedleControllerOwner(options)
+    local previous=options.Environment[options.Key]
+    if type(previous)=="table"and type(previous.Stop)=="function"then pcall(previous.Stop,"replaced")end
+    local api={Active=true,Cleanups={},RetiredHandlers=0}
+    options.Environment[options.Key]=api
+    function api.Owns()return api.Active and options.Environment[options.Key]==api end
+    function api.AddCleanup(fn)
+        if api.Active then api.Cleanups[#api.Cleanups+1]=fn else pcall(fn)end
+    end
+    function api.Stop(reason)
+        if not api.Active then return end
+        api.Active=false
+        -- Only the old instance's in-memory mode flags are suspended. Saved settings and the new instance are untouched.
+        if reason=="replaced"then
+            for _,key in ipairs({"AutoPickupNeedle","AutoHandInNeedle","AutoFarmWins","AutoFarmHay"})do options.State[key]=false end
+        end
+        for _,fn in ipairs(api.Cleanups)do pcall(fn)end
+        table.clear(api.Cleanups)
+    end
+    function api.RetireLegacy(currentFunction)
+        if not api.Owns()or not options.Candidates then return 0 end
+        local ok,list=pcall(options.Candidates)
+        if not ok or type(list)~="table"then return 0 end
+        local count=0
+        for _,entry in ipairs(list)do
+            if entry.Function~=currentFunction and entry.Verified and type(entry.State)=="table"then
+                local stopped=pcall(entry.Disconnect)
+                if stopped then
+                    count+=1
+                    if entry.State~=options.State then
+                        for _,key in ipairs({"AutoPickupNeedle","AutoHandInNeedle","AutoFarmWins","AutoFarmHay"})do entry.State[key]=false end
+                    end
+                end
+            end
+        end
+        api.RetiredHandlers+=count;return count
+    end
+    return api
+end
+
+        State.__NeedleController=createNeedleControllerOwner({Environment=env,Key="__BEYY_CH1_NEEDLE_CONTROLLER_V1",
+            State=State,Candidates=candidates})
+        local previous=_G.__BEYY_HUB_CLEANUP
+        _G.__BEYY_HUB_CLEANUP=function()
+            State.__NeedleController.Stop("hub cleanup")
+            if previous then pcall(previous)end
+        end
+    end)()
+end
+
 local needlePickupActive = false
 local autoUiMouseBusy = false
 
@@ -5022,6 +5109,7 @@ do
     (function()
     local SETTINGS = { HeightAboveNeedle = 2.5, HorizontalOffsetStuds = 2.0, MaxClicks = 8, MousePressSeconds = 0.085, OwnershipWaitSeconds = 0.055, RetryDelay = 0.16,
         FilterRadiusPixels = 50, FilterNeedleRadiusStuds = 8, FilterMaxParts = 400 }
+    local function pickupStopped()return Unloaded or not State.__NeedleController.Owns()end
     local busy = false
     local lastAttempt = -math.huge
     local trackedNeedle = nil
@@ -5038,7 +5126,7 @@ do
     end
     local function owned() return LocalPlayer:GetAttribute("NeedleOwned") == true end
     local function tryPickup(needle)
-        if busy or Unloaded or roundEndingVisible() or not (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) or owned() or not needle or not needle.Parent then return false end
+        if busy or pickupStopped() or roundEndingVisible() or not (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) or owned() or not needle or not needle.Parent then return false end
         busy = true
         needlePickupActive = true
         local started = os.clock()
@@ -5102,7 +5190,7 @@ do
                     if folder then
                         for _, part in ipairs(folder:GetDescendants()) do
                             if queryStats.filtered >= SETTINGS.FilterMaxParts then break end
-                            if Unloaded or not (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) or observedOwnership then return end
+                            if pickupStopped() or not (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) or observedOwnership then return end
                             if part:IsA("BasePart") and part ~= needle
                                 and part:GetAttribute("IsNeedleObjective") ~= true
                                 and part.CanQuery and not filteredParts[part] then
@@ -5158,7 +5246,7 @@ do
         end
         local function waitForConfirmation(seconds)
             local deadline = os.clock() + seconds
-            while not Unloaded and (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) and os.clock() < deadline do
+            while not pickupStopped() and (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) and os.clock() < deadline do
                 captureOwnership()
                 if observedOwnership then return true end
                 task.wait(0.025)
@@ -5231,9 +5319,9 @@ do
             previousPickupCameraCFrame = cam.CFrame
             pickupCameraCaptured = true
             local inputDeadline = os.clock() + 0.8
-            while autoUiMouseBusy and os.clock() < inputDeadline and not Unloaded do task.wait(0.01) end
+            while autoUiMouseBusy and os.clock() < inputDeadline and not pickupStopped() do task.wait(0.01) end
             if autoUiMouseBusy then failureReason = "UI click still owns mouse"; return end
-            if Unloaded or not (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) then failureReason = "Pickup cancelled before teleport"; return end
+            if pickupStopped() or not (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) then failureReason = "Pickup cancelled before teleport"; return end
             local rootToPivot = root.CFrame:ToObjectSpace(char:GetPivot())
 
             local cameraForward = cam.CFrame.LookVector
@@ -5263,7 +5351,7 @@ do
             -- Use the native objective protocol first; preserve click pickup as fallback.
             placeNearNeedle()
             task.wait(0.20)
-            if Unloaded or not (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) or roundEndingVisible() or not needle.Parent then
+            if pickupStopped() or not (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) or roundEndingVisible() or not needle.Parent then
                 failureReason = "Pickup cancelled before native request"; return
             end
             captureOwnership()
@@ -5280,7 +5368,7 @@ do
             local cameraPosition = targetRootPosition - horizontalForward * 3.5
                 + Vector3.new(0, 3.5, 0)
             local function aimAtNeedle()
-                if Unloaded or not needle.Parent or observedOwnership or roundEndingVisible() then return end
+                if pickupStopped() or not needle.Parent or observedOwnership or roundEndingVisible() then return end
                 if Workspace.CurrentCamera ~= cam then return end
                 cam.CameraType = Enum.CameraType.Scriptable
                 cam.CFrame = CFrame.lookAt(cameraPosition, needle.Position, Vector3.yAxis)
@@ -5289,7 +5377,7 @@ do
             captureOwnership()
             if observedOwnership then success = true; return end
             local function forceHover()
-                if not Unloaded and (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) and needle.Parent and not observedOwnership then
+                if not pickupStopped() and (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) and needle.Parent and not observedOwnership then
                     aimAtNeedle()
                     if LocalPlayer:GetAttribute("HoveredHayId") ~= needleId then
                         LocalPlayer:SetAttribute("HoveredHayId", needleId)
@@ -5307,7 +5395,7 @@ do
             for i = 1, SETTINGS.MaxClicks do
                 captureOwnership()
                 if observedOwnership then success = true; break end
-                if Unloaded or not (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) or roundEndingVisible() then failureReason = "Pickup cancelled at round end"; break end
+                if pickupStopped() or not (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) or roundEndingVisible() then failureReason = "Pickup cancelled at round end"; break end
                 if not needle.Parent then failureReason = "Needle disappeared before confirmation"; break end
                 if not char.Parent or not root.Parent then failureReason = "Character disappeared"; break end
                 local distance = (root.Position - needle.Position).Magnitude
@@ -5367,6 +5455,10 @@ do
         cleanup()
         return success
     end
+    State.__NeedleController.AddCleanup(function()
+        if activeCleanup then pcall(activeCleanup)end
+        pcall(function()RunService:UnbindFromRenderStep(renderName)end)
+    end)
     local previousCleanup = _G.__BEYY_HUB_CLEANUP
     _G.__BEYY_HUB_CLEANUP = function()
         if previousCleanup then pcall(previousCleanup) end
@@ -5374,9 +5466,9 @@ do
         pcall(function() RunService:UnbindFromRenderStep(renderName) end)
     end
     task.spawn(function()
-        while not Unloaded do
+        while not pickupStopped() do
             task.wait(0.05)
-        if Unloaded then break end
+        if pickupStopped() then break end
             if not IN_GAME or roundEndingVisible() or not (State.AutoPickupNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) or owned() then
                 trackedNeedle = nil
             else
@@ -5409,8 +5501,8 @@ do
     local settleUntil=0
     local positioned=false
     local character
-    local connection=RunService.Heartbeat:Connect(function()
-        if Unloaded or not IN_GAME then return end
+    local function handInTick()
+        if Unloaded or not IN_GAME or not State.__NeedleController.Owns()then return end
         if not (State.AutoHandInNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) or needlePickupActive or roundEndingVisible() then return end
         if LocalPlayer:GetAttribute("NeedleOwned")~=true then nextRequest=0;settleUntil=0;positioned=false;character=nil;return end
         local root=getHRP()
@@ -5431,7 +5523,16 @@ do
         if not Unloaded and (State.AutoHandInNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) and LocalPlayer:GetAttribute("NeedleOwned")==true then
             pcall(function() NeedleHandIn:FireServer() end)
         end
-    end)
+    end
+    local connection=RunService.Heartbeat:Connect(handInTick)
+    State.__NeedleController.AddCleanup(function()connection:Disconnect()end)
+    local function retireDuplicates()
+        local count=State.__NeedleController.RetireLegacy(handInTick)
+        if count>0 then print("[Needle] Retired "..count.." duplicate legacy hand-in controller(s)")end
+    end
+    retireDuplicates()
+    -- Catch older queued loaders that finish attaching shortly after this instance.
+    task.delay(2,retireDuplicates);task.delay(8,retireDuplicates)
     local previousCleanup=_G.__BEYY_HUB_CLEANUP
     _G.__BEYY_HUB_CLEANUP=function()
         connection:Disconnect()
@@ -6134,4 +6235,5 @@ end)
 
 end)()
 end
+
 
