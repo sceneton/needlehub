@@ -434,6 +434,55 @@ end
 
 -- Pitchfork-only targeting: maintain child slots and budget large searches.
 -- Opt-in local traces. Never issues gameplay requests or input.
+local function createChapter5GrassVisibility(world)
+    local api={}
+    local enabled,alive=false,true
+    local hidden={}
+    local added
+    -- Verified decorative meshes from Chapter 5. Never match collectible hay by name.
+    local assets={
+        ["103217178175958"]=true,["102928738001465"]=true,["127886107848822"]=true,
+        ["104323643416798"]=true,["110445097892661"]=true,["93443489140535"]=true,
+        ["85884435633156"]=true,["77697391368219"]=true,["77965045617364"]=true,
+    }
+    local function hide(obj)
+        if not alive or not enabled or hidden[obj]or not obj:IsA("MeshPart")then return end
+        if not obj.Name:lower():match("^grass")or not assets[tostring(obj.MeshId):match("%d+$")]then return end
+        if obj:GetAttribute("HayId")or obj:GetAttribute("GemId")then return end
+        hidden[obj]={Transparency=obj.LocalTransparencyModifier,Shadow=obj.CastShadow}
+        obj.LocalTransparencyModifier=1;obj.CastShadow=false
+    end
+    function api.SetEnabled(value)
+        value=alive and value==true
+        if enabled==value then return end
+        enabled=value
+        if added then added:Disconnect();added=nil end
+        if not enabled then
+            for obj,saved in pairs(hidden)do
+                pcall(function()obj.LocalTransparencyModifier=saved.Transparency;obj.CastShadow=saved.Shadow end)
+            end
+            table.clear(hidden);return
+        end
+        added=world.DescendantAdded:Connect(hide)
+        -- Hay folders can be enormous. Discover only the map decorations and direct assets.
+        local started=os.clock()
+        for _,obj in ipairs(world:GetChildren())do
+            if not enabled then return end
+            hide(obj)
+            if obj.Name=="Map"or obj.Name=="SundialRuins"or obj.Name=="GraveyardMap"then
+                for i,desc in ipairs(obj:GetDescendants())do
+                    if not enabled then return end
+                    hide(desc)
+                    if i%64==0 and os.clock()-started>=0.001 then task.wait();started=os.clock()end
+                end
+            end
+        end
+    end
+    function api.Stop()api.SetEnabled(false);alive=false end
+    return api
+end
+
+
 local function createChapter5Diagnostics(options)
     local api={Entries={}}
     local alive=true
@@ -2461,7 +2510,7 @@ end
         return(tabletController and tabletController.IsBusy())or(sundialController and sundialController.IsBusy())or(potionController and potionController.IsBusy())or false
     end
     local sharedFarmDefaults = {
-        AutoPickHay=false, AutoCollectDroppedHay=false, AutoCollectGems=false, CollectInterval=0.5,
+        HideDecorativeGrass=false, AutoPickHay=false, AutoCollectDroppedHay=false, AutoCollectGems=false, CollectInterval=0.5,
         AutoSellHay=false, SellThreshold=25, SellOnlyIfFull=false,
         AutoUseTNT=false, AutoUsePitchfork=false, AutoDeployDrone=false,
         TntLightCooldown=0, TntThrowDelay=0.4,
@@ -2561,6 +2610,23 @@ end
         })
         Registry[key] = element
         return element
+    end
+    do
+        local grassVisibility=createChapter5GrassVisibility(Workspace)
+        Registry.HideDecorativeGrass=overviewTab:Toggle({Title="Hide Decorative Grass",Value=sharedFarmState.HideDecorativeGrass,
+            Desc="Hide Chapter 5 decorative grass locally. Switch off to restore it.",
+            Callback=function(enabled)
+                sharedFarmState.HideDecorativeGrass=enabled==true
+                saveSharedFarmSettings()
+                grassVisibility.SetEnabled(enabled)
+            end,
+        })
+        grassVisibility.SetEnabled(sharedFarmState.HideDecorativeGrass)
+        local previous=_G.__BEYY_HUB_CLEANUP
+        _G.__BEYY_HUB_CLEANUP=function()
+            grassVisibility.Stop()
+            if previous then pcall(previous)end
+        end
     end
     collectingTab:Section({ Title="Resource Collecting" })
     farmToggle(collectingTab,"AutoPickHay","Auto Pick Hay")
