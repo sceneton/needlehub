@@ -80,6 +80,7 @@ end
 
 -- Standalone observer: does not issue gameplay requests, clicks, teleports or attribute writes.
 local ROOT="BeyyHub"
+local RECORDER_VERSION="2"
 local SOURCE_URL="https://raw.githubusercontent.com/sceneton/needlehub/main/needle-latency-diagnostics.lua"
 local CACHE_PATH=ROOT.."/needle_latency_recorder.lua"
 local ENABLED_PATH=ROOT.."/needle_latency_enabled.txt"
@@ -101,7 +102,7 @@ pcall(function()if type(makefolder)=="function"then makefolder(ROOT)end end)
 local env=type(getgenv)=="function"and getgenv()or _G
 local old=env.BeyyNeedleLatency
 if type(old)=="table"and type(old.Stop)=="function"then pcall(old.Stop,"Replaced",true)end
-local run={Running=true,SessionId=H:GenerateGUID(false),QueueInstalled=false,Hooks={}}
+local run={Running=true,Version=RECORDER_VERSION,SessionId=H:GenerateGUID(false),QueueInstalled=false,Hooks={}}
 env.BeyyNeedleLatency=run
 local connections,needleConnections={},{}
 local needleFolder,needleParts=nil,{}
@@ -319,7 +320,7 @@ task.spawn(function()
     pcall(function()enabled=T:GetTeleportSetting(%q)end)
     if type(readfile)=="function"then local ok,v=pcall(readfile,%q);if ok and v=="false"then enabled=false elseif ok and v=="true"and enabled==nil then enabled=true end end
     if enabled==false then return end
-    local ok,source=pcall(function()return game:HttpGet(%q)end)
+    local ok,source=pcall(function()return game:HttpGet(%q.."?needletrace="..tostring(os.time()))end)
     local fn=ok and type(source)=="string"and loadstring(source)
     if not fn and type(readfile)=="function"then ok,source=pcall(readfile,%q);if ok and type(source)=="string"then fn=loadstring(source)end end
     if fn then fn()else warn("[Needle Trace] Queued recorder could not load or compile.")end
@@ -336,7 +337,7 @@ elseif type(queue)=="function"then
 else record("QueueUnavailable")end
 -- Keep a last known working copy for teleports where GitHub cannot be reached.
 task.spawn(function()
-    local ok,source=pcall(function()return game:HttpGet(SOURCE_URL)end)
+    local ok,source=pcall(function()return game:HttpGet(SOURCE_URL.."?needletrace="..tostring(os.time()))end)
     if ok and run.Running and type(source)=="string"and type(loadstring(source))=="function"then pcall(writefile,CACHE_PATH,source)end
 end)
 hook(player.AttributeChanged:Connect(function(name)
@@ -359,7 +360,7 @@ function run.Stop(reason,keepEnabled)
 end
 function run.Export()return recorder.Flush(lastWorld)end
 record("SessionStarted",{BootWaitMs=(os.clock()-boot)*1000,QueueInstalled=run.QueueInstalled,
-    PriorSession=old and old.SessionId,HookStatus=run.Hooks,JobId=game.JobId})
+    PriorSession=old and old.SessionId,Version=RECORDER_VERSION,HookStatus=run.Hooks,JobId=game.JobId})
 bindRemoteObserver();bindNeedle();discoverControllers()
 if player:GetAttribute("NeedleOwned")==true then recorder.Ownership(true,true)end
 recorder.Flush(snapshot(false))
