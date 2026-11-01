@@ -1244,7 +1244,8 @@ local function createFarmerCameraLock(options)
         local eye=root.Position+Vector3.new(0,1.5,0)
         if(target.Position-eye).Magnitude<0.1 then return end
         camera.CameraType=Enum.CameraType.Scriptable
-        lastView=CFrame.lookAt(eye,target.Position)
+        local captured=options.ViewPose and options.ViewPose(root,farmer)
+        lastView=captured or CFrame.lookAt(eye,target.Position)
         camera.CFrame=lastView
         camera.Focus=CFrame.new(target.Position)
     end
@@ -1298,7 +1299,11 @@ local function createFarmerClick(options)
         local ok,err=pcall(function()
             assert(allowed(),"Potion click cancelled")
             point=aimPoint()
-            if not point or(options.MouseLocked and options.MouseLocked())or(head and(camera.CFrame.Position-eye).Magnitude>8)then
+            if persistent then
+                options.FrameWait()
+                assert(allowed(),"Potion click cancelled")
+                point=aimPoint()
+            elseif not point or(options.MouseLocked and options.MouseLocked())or(head and(camera.CFrame.Position-eye).Magnitude>8)then
                 local target=farmer:FindFirstChild("Torso")or farmer:FindFirstChild("Head")or farmer:FindFirstChild("HumanoidRootPart")
                 assert(target,"Farmer body unavailable")
                 aimed=CFrame.lookAt(eye,target.Position)
@@ -2090,7 +2095,7 @@ end
     local sundialStatus=tabletTab:Paragraph({Title="Sundial Status",Desc="Disabled"})
     tabletTab:Section({Title="Potion"})
     farmToggle(tabletTab,"AutoBringPotion","Auto Bring Potion to Farmer",
-        "Teleport beside the farmer, keep the camera locked on him and click to give the potion. This starts the boss fight. Close the menu to run.")
+        "Use your saved farmer position and camera pose, keep the view locked and click to give the potion. This starts the boss fight. Close the menu to run.")
     local potionStatus=tabletTab:Paragraph({Title="Potion Hand-in Status",Desc="Disabled"})
     shopTab:Section({ Title="Purchasing" })
     Registry.BuyToolsList = shopTab:Dropdown({
@@ -2461,9 +2466,37 @@ end
         sundialController=createSundialAutomation(sundialOptions)
         local potionOptions=table.clone(interactionOptions)
         potionOptions.Player=LocalPlayer
-        potionOptions.Approach=createFarmerApproach({World=Workspace,Player=LocalPlayer})
+        -- User-captured hand-in pose, Chapter 5, 1 November 2026.
+        local savedFarmerPose=CFrame.new(-249.708892822,5.14999771118,24.4543495178,-0.0276857335120,4.19544843311e-10,0.999616682529,3.79587810073e-8,1.00000000000,6.31613927826e-10,-0.999616682529,3.79617155488e-8,-0.0276857335120)
+        local savedFarmerCamera=CFrame.new(-249.227172852,6.83330154419,24.4410076141,-0.0276869274676,-0.266504645348,0.963435947895,0.00000000000,0.963805377483,0.266606867313,-0.999616622925,0.00738152489066,-0.0266848113388)
+        local savedCameraOffset=savedFarmerPose:ToObjectSpace(savedFarmerCamera)
+        local function clearFarmerView(view,farmer)
+            local params=RaycastParams.new()
+            params.FilterType=Enum.RaycastFilterType.Exclude;params.IgnoreWater=true
+            params.FilterDescendantsInstances={LocalPlayer.Character,Workspace.CurrentCamera}
+            local hit=Workspace:Raycast(view.Position,view.LookVector*500,params)
+            return hit and hit.Instance:IsDescendantOf(farmer)
+        end
+        local fallbackFarmerApproach=createFarmerApproach({World=Workspace,Player=LocalPlayer})
+        potionOptions.Approach=function(target,root,hum,farmer,range)
+            if(savedFarmerPose.Position-target).Magnitude<=12 and clearFarmerView(savedFarmerCamera,farmer)then
+                local params=RaycastParams.new()
+                params.FilterType=Enum.RaycastFilterType.Exclude;params.RespectCanCollide=true
+                params.FilterDescendantsInstances={LocalPlayer.Character,farmer}
+                local hit=Workspace:Raycast(savedFarmerPose.Position+Vector3.new(0,4,0),Vector3.new(0,-12,0),params)
+                if hit and hit.Normal.Y>=0.8 then
+                    local supportedY=hit.Position.Y+hum.HipHeight+root.Size.Y/2
+                    if math.abs(supportedY-savedFarmerPose.Position.Y)<=1.5 then return savedFarmerPose end
+                end
+            end
+            return fallbackFarmerApproach(target,root,hum,farmer,range)
+        end
         local farmerView=createFarmerCameraLock({
             World=Workspace,Player=LocalPlayer,
+            ViewPose=function(root,farmer)
+                local view=root.CFrame*savedCameraOffset
+                return clearFarmerView(view,farmer)and view or nil
+            end,
             Shared=function()return ReplicatedStorage:FindFirstChild("NeedleHaystack")end,
             Enabled=function()return not hubUnloaded and sharedFarmState.AutoBringPotion==true and hubWindow.Closed==true end,
         })
