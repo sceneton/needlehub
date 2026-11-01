@@ -433,122 +433,137 @@ local function installAntiIdle(tab, registry, isRunning)
 end
 
 -- Pitchfork-only targeting: maintain child slots and budget large searches.
-local function createPitchforkSelector(allowModels, preferHovered, options)
-    options=options or {}
+local function createSharedFolderIndex()
+    local api={}
+    local alive=true
+    local entries={}
+    local function remove(entry,obj)
+        local index=entry.Positions[obj]
+        if not index then return end
+        local last=entry.Items[#entry.Items]
+        entry.Items[index]=last;entry.Positions[last]=index
+        entry.Items[#entry.Items]=nil;entry.Positions[obj]=nil
+    end
+    local function clear(entry)
+        entry.Ready=false;entry.Alive=false
+        for _,c in ipairs(entry.Connections)do c:Disconnect()end
+        table.clear(entry.Connections);table.clear(entry.Items);table.clear(entry.Positions);table.clear(entry.Results)
+    end
+    function api.Get(folder)
+        if not alive or not folder or not folder.Parent then return nil end
+        local entry=entries[folder]
+        if entry then return entry.Ready and entry or nil end
+        entry={Items={},Positions={},Connections={},Results={},Alive=true,Ready=false}
+        entries[folder]=entry
+        local function add(obj)
+            if entry.Alive and obj.Parent==folder and not entry.Positions[obj]then
+                entry.Items[#entry.Items+1]=obj;entry.Positions[obj]=#entry.Items
+            end
+        end
+        entry.Connections[1]=folder.ChildAdded:Connect(add)
+        entry.Connections[2]=folder.ChildRemoved:Connect(function(obj)remove(entry,obj)end)
+        entry.Connections[3]=folder.AncestryChanged:Connect(function()
+            if not folder.Parent and entries[folder]==entry then clear(entry);entries[folder]=nil end
+        end)
+        local started=os.clock()
+        for i,obj in ipairs(folder:GetChildren())do
+            if not alive or not entry.Alive then return nil end
+            add(obj)
+            if i%64==0 and os.clock()-started>=0.001 then task.wait();started=os.clock()end
+        end
+        if not entry.Alive or not folder.Parent then return nil end
+        entry.Ready=true
+        return entry
+    end
+    function api.Stop()
+        alive=false
+        for _,entry in pairs(entries)do clear(entry)end
+        table.clear(entries)
+    end
+    return api
+end
+local sharedFolderIndex=createSharedFolderIndex()
+
+local function createPitchforkSelector(allowModels,preferHovered,options)
+    options=options or{}
     local folderName=options.FolderName or "HaystackClient"
     local idName=options.IdName or "HayId"
     local range=options.Range or 30
-    local function targetId(part,obj)
-        if options.ObjectId then return obj end
-        return part:GetAttribute(idName) or (allowModels and not options.PartIdOnly and obj:GetAttribute(idName))
+    local key=table.concat({idName,tostring(range),tostring(allowModels),tostring(preferHovered),tostring(options.ObjectId),
+        tostring(options.PartIdOnly),tostring(options.ReturnObject),tostring(options.Recursive),tostring(options.AllowContainers)},":")
+    local alive=true
+    local function id(part,obj)
+        return options.ObjectId and obj or part:GetAttribute(idName)or(allowModels and not options.PartIdOnly and obj:GetAttribute(idName))
     end
-    local alive, folder = true, nil
-    local slots, positions, freeSlots, connections = {}, {}, {}, {}
-    local slotCount = 0
-    local lastTarget, lastTargetTime
-    local function clearFolder()
-        for _,c in ipairs(connections) do c:Disconnect() end
-        table.clear(connections); table.clear(slots); table.clear(positions); table.clear(freeSlots)
-        slotCount=0; lastTarget=nil; lastTargetTime=nil
-    end
-    local function add(obj)
-        if positions[obj] or not (obj:IsA("BasePart") or (allowModels and (obj:IsA("Model") or options.AllowContainers))) then return end
-        local index=table.remove(freeSlots)
-        if not index then slotCount+=1; index=slotCount end
-        slots[index]=obj; positions[obj]=index
-    end
-    local function remove(obj)
-        local index=positions[obj]
-        if not index then return end
-        positions[obj]=nil; slots[index]=false; freeSlots[#freeSlots+1]=index
-        if lastTarget==obj or (lastTarget and lastTarget:IsDescendantOf(obj)) then lastTarget=nil end
-    end
-    local function watchFolder(current)
-        if current==folder then return end
-        clearFolder(); folder=current
-        if not folder then return end
-        connections[1]=folder.ChildAdded:Connect(add)
-        connections[2]=folder.ChildRemoved:Connect(remove)
-        local scanFolder=folder
-        local sliceStarted=os.clock()
-        for index,obj in ipairs(folder:GetChildren()) do
-            if not alive or folder~=scanFolder then return end
-            if obj.Parent==scanFolder then add(obj) end
-            if index%32==0 and os.clock()-sliceStarted>=0.002 then task.wait(); sliceStarted=os.clock() end
-        end
-    end
-    local function stop()
-        alive=false; clearFolder(); folder=nil
-    end
-    local function selectTarget(isAllowed, cacheSeconds)
-        if not alive or not isAllowed() then return nil end
-        local current=Workspace:FindFirstChild(folderName)
-        watchFolder(current)
-        if not alive or not isAllowed() then return nil end
+    local function selectTarget(isAllowed,cacheSeconds)
+        if not alive or not isAllowed()then return nil end
+        local folder=Workspace:FindFirstChild(folderName)
+        local entry=sharedFolderIndex.Get(folder)
         local character=LocalPlayer.Character
         local root=character and character:FindFirstChild("HumanoidRootPart")
-        if not folder or not root then return nil end
-        local hovered=preferHovered and LocalPlayer:GetAttribute("HoveredHayId") or nil
-        if lastTarget and lastTarget.Parent and lastTarget:IsDescendantOf(folder)
-            and os.clock()-(lastTargetTime or 0)<(cacheSeconds or 0)
-            and not options.ObjectId and lastTarget:GetAttribute(idName) then return lastTarget,lastTarget:GetAttribute(idName) end
-        local best,bestId,hoveredPart,hoveredId=nil,nil,nil,nil
-        local bestObject,hoveredObject
-        local bestDistance=range*range
-        local sliceStarted=os.clock()
+        if not entry or not root or not isAllowed()then return nil end
         local origin=root.Position
-        local scanFolder=folder
+        local hovered=preferHovered and LocalPlayer:GetAttribute("HoveredHayId")or nil
+        local cached=entry.Results[key]
+        if cached and not hovered and cached.Character==character and os.clock()-cached.At<(cacheSeconds or 0.15)
+            and cached.Object.Parent==folder and cached.Part:IsDescendantOf(folder)
+            and(cached.Part.Position-origin).Magnitude<range then
+            local value=id(cached.Part,cached.Object)
+            if value then return options.ReturnObject and cached.Object or cached.Part,value end
+        end
+        local best,bestObject,bestId,hoveredPart,hoveredObject,hoveredId
+        local distance=range*range
+        local started=os.clock()
         local index=1
-        while index<=slotCount do
-            if not alive or folder~=scanFolder or not scanFolder.Parent then return nil end
-            local obj=slots[index]
-            if obj and obj.Parent==scanFolder then
-                local part=obj:IsA("BasePart") and obj or ((obj:IsA("Model") and obj.PrimaryPart) or obj:FindFirstChildWhichIsA("BasePart",options.Recursive~=false))
+        while index<=#entry.Items do
+            if not alive or not entry.Alive then return nil end
+            local obj=entry.Items[index]
+            if obj and obj.Parent==folder then
+                local part=obj:IsA("BasePart")and obj or(allowModels and(obj:IsA("Model")or options.AllowContainers)
+                    and(obj:IsA("Model")and obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart",options.Recursive~=false)))
                 if part then
-                    local id=targetId(part,obj)
-                    if id then
-                        if hovered and id==hovered then hoveredPart,hoveredId,hoveredObject=part,id,obj end
+                    local value=id(part,obj)
+                    if value then
                         local delta=part.Position-origin
-                        local distance=delta:Dot(delta)
-                        if distance<bestDistance then best,bestId,bestDistance,bestObject=part,id,distance,obj end
+                        local d=delta:Dot(delta)
+                        if d<distance then best,bestObject,bestId,distance=part,obj,value,d end
+                        if hovered and value==hovered then hoveredPart,hoveredObject,hoveredId=part,obj,value end
                     end
                 end
             end
             index+=1
-            if index%32==0 and os.clock()-sliceStarted>=0.002 then
-                if not isAllowed() then return nil end
-                task.wait()
-                sliceStarted=os.clock()
+            if index%64==0 then
+                if not isAllowed()then return nil end
+                if os.clock()-started>=0.0005 then task.wait();started=os.clock()end
             end
         end
-        best,bestId=hoveredPart or best,hoveredId or bestId
-        bestObject=hoveredObject or bestObject
-        if not best or not best.Parent or not best:IsDescendantOf(scanFolder) then return nil end
-        if not alive or not isAllowed() or Workspace:FindFirstChild(folderName)~=scanFolder
-            or LocalPlayer.Character~=character then return nil end
-        -- Recheck range after any yield; hovered selection keeps Chapter 1's rules.
-        local delta=best.Position-root.Position
-        if not hoveredPart and delta:Dot(delta)>=range*range then return nil end
-        lastTarget,lastTargetTime=best,os.clock()
-        local currentId=targetId(best,bestObject)
-        if not currentId then lastTarget=nil; return nil end
-        return options.ReturnObject and bestObject or best,currentId
+        best,bestObject,bestId=hoveredPart or best,hoveredObject or bestObject,hoveredId or bestId
+        if not best or bestObject.Parent~=folder or not best:IsDescendantOf(folder)or not alive or not isAllowed()
+            or Workspace:FindFirstChild(folderName)~=folder or LocalPlayer.Character~=character then return nil end
+        if not hoveredPart and(best.Position-root.Position).Magnitude>=range then return nil end
+        bestId=id(best,bestObject)
+        if not bestId then return nil end
+        entry.Results[key]={Part=best,Object=bestObject,At=os.clock(),Character=character}
+        return options.ReturnObject and bestObject or best,bestId
     end
-    return selectTarget,stop
+    return selectTarget,function()alive=false end
 end
 local function budgetedFolderChildren(folder,isAllowed,descendants)
-    local children=descendants and folder:GetDescendants() or folder:GetChildren()
+    -- Dense membership is shared with the target selectors; no large per-pickup copy.
+    local entry=not descendants and sharedFolderIndex.Get(folder)
+    local children=entry and entry.Items or(descendants and folder:GetDescendants()or{})
     local index,started=0,os.clock()
     return function()
-        if not folder.Parent or not isAllowed() then return nil end
-        index+=1
+        if not folder.Parent or not isAllowed()then return nil end
+        repeat index+=1 until not children[index]or children[index].Parent==folder or descendants
         local obj=children[index]
         if not obj then return nil end
-        if index%32==0 and os.clock()-started>=0.002 then task.wait(); started=os.clock() end
-        if not folder.Parent or not isAllowed() then return nil end
+        if index%64==0 and os.clock()-started>=0.0005 then task.wait();started=os.clock()end
+        if not folder.Parent or not isAllowed()then return nil end
         return index,obj
     end
 end
+
 
 local selectPitchforkHay, stopPitchforkSelector = createPitchforkSelector(true, false)
 -- Start intro input before constructing the menu or waiting for gameplay assets.
@@ -1166,6 +1181,85 @@ local function createSundialAutomation(options)
 end
 
 
+local function createOverlayMaskIndex(options)
+    local api={}
+    local current,dirty
+    local nodes,connections={},{ }
+    local function restore(obj,entry)
+        for _,c in ipairs(entry.Properties)do c:Disconnect()end
+        table.clear(entry.Properties)
+        entry.Matching=false
+        options.Restore(obj)
+    end
+    local function apply(obj,entry,key)
+        if entry.Applying or not entry.Matching then return end
+        entry.Applying=true
+        options.Mask(obj,key)
+        entry.Applying=false
+    end
+    local function eligible(obj)
+        local node=obj
+        while node and node~=current do
+            if node:IsA("ScreenGui")then return options.IsOverlay(node)end
+            node=node.Parent
+        end
+        return false
+    end
+    local function refresh(obj,entry)
+        local matching=entry.Keys and eligible(obj)or false
+        if matching==entry.Matching then return end
+        if not matching then restore(obj,entry);return end
+        entry.Matching=true
+        for _,key in ipairs(entry.Keys)do
+            entry.Properties[#entry.Properties+1]=obj:GetPropertyChangedSignal(key):Connect(function()apply(obj,entry,key)end)
+            apply(obj,entry,key)
+        end
+    end
+    local function remove(obj)
+        local entry=nodes[obj];if not entry then return end
+        nodes[obj]=nil
+        for _,c in ipairs(entry.Connections)do c:Disconnect()end
+        restore(obj,entry)
+    end
+    local function add(obj)
+        if nodes[obj]then return end
+        local keys
+        if obj:IsA("GuiObject")then
+            keys={"BackgroundTransparency"}
+            if obj:IsA("CanvasGroup")then keys[#keys+1]="GroupTransparency"end
+            if obj:IsA("TextLabel")or obj:IsA("TextButton")or obj:IsA("TextBox")then
+                keys[#keys+1]="TextTransparency";keys[#keys+1]="TextStrokeTransparency"
+            elseif obj:IsA("ImageLabel")or obj:IsA("ImageButton")then keys[#keys+1]="ImageTransparency"end
+        elseif obj:IsA("UIStroke")then keys={"Transparency"}end
+        local entry={Keys=keys,Connections={},Properties={},Matching=false}
+        nodes[obj]=entry
+        entry.Connections[1]=obj.AncestryChanged:Connect(function()if current and obj:IsDescendantOf(current)then dirty=true else remove(obj)end end)
+        if obj:IsA("ScreenGui")or obj:IsA("GuiObject")then
+            entry.Connections[2]=obj:GetPropertyChangedSignal("Name"):Connect(function()dirty=true end)
+        end
+        refresh(obj,entry)
+    end
+    function api.Clear()
+        for _,c in ipairs(connections)do c:Disconnect()end
+        table.clear(connections)
+        for obj in pairs(nodes)do remove(obj)end
+        current=nil;dirty=false
+    end
+    function api.Bind(gui)
+        if current~=gui then
+            api.Clear();current=gui
+            if gui then
+                connections[1]=gui.DescendantAdded:Connect(add)
+                connections[2]=gui.DescendantRemoving:Connect(remove)
+                for _,obj in ipairs(gui:GetDescendants())do add(obj)end
+            end
+        end
+        if dirty then dirty=false;for obj,entry in pairs(nodes)do refresh(obj,entry)end end
+    end
+    return api
+end
+
+
 local function createFarmerApproach(options)
     return function(target,root,hum,farmer)
         local floorParams=RaycastParams.new()
@@ -1439,6 +1533,51 @@ local function createPotionHandIn(options)
 end
 
 
+local function createBossHitEffectBudget(options)
+    local api={}
+    local alive=true
+    local module,methods
+    local originals,wrappers={},{}
+    local nextRead=0
+    local function restore()
+        if methods then
+            for name,wrapper in pairs(wrappers)do
+                if methods[name]==wrapper then methods[name]=originals[name]end
+            end
+        end
+        module=nil;methods=nil;table.clear(originals);table.clear(wrappers)
+    end
+    function api.Tick()
+        if not alive then return end
+        if not options.Enabled()then restore();return end
+        if options.Now()<nextRead then return end
+        nextRead=options.Now()+1
+        local current=options.Module()
+        if current==module then return end
+        restore()
+        if not current then return end
+        -- Only bind after the native client has loaded the weak-spot module.
+        -- These two exports are used solely for critical/break hit decoration.
+        local ok,value=pcall(options.Load,current)
+        if not ok or type(value)~="table"then return end
+        module,methods=current,value
+        for _,name in ipairs({"crit","smash"})do
+            local original=methods[name]
+            if type(original)=="function"then
+                originals[name]=original
+                local wrapper=function(...)
+                    if alive and options.Enabled()then return end
+                    return original(...)
+                end
+                wrappers[name]=wrapper;methods[name]=wrapper
+            end
+        end
+    end
+    function api.Stop()alive=false;restore()end
+    return api
+end
+
+
 local function createFarmerBossCombat(options)
     local api={}
     local alive,nextSend=true,0
@@ -1703,6 +1842,7 @@ do
         hubUnloaded = true
         stopEarlyIntro()
         if stopPitchforkSelector then pcall(stopPitchforkSelector) end
+        sharedFolderIndex.Stop()
         if hubRestoreAction then pcall(hubRestoreAction) end
         if hubCursorCleanup then pcall(hubCursorCleanup) end
         if hubWindow then pcall(function() hubWindow:Destroy() end) end
@@ -2112,7 +2252,7 @@ end
         AutoUseVacuum=false, VacuumHotbarSlot=5, ToolInterval=0.5,
         AutoPickupTablets=false, AutoSolveSundial=false, AutoBringPotion=false,
         Chapter5AutoBossFight=false, Chapter5BossWeakPoints=true, Chapter5BossBodyHits=true,
-        Chapter5BossVacuum=false, Chapter5BossAimVacuum=true,
+        Chapter5BossVacuum=false, Chapter5BossAimVacuum=true, Chapter5ReduceHitEffects=true,
         AutoBuyTools=false, BuyToolsList={"Pitchfork"}, BuyInterval=1,
         UpgBagSize=false, UpgExtraTake=false, UpgGemValue=false, UpgHayValue=false, PermInterval=0.5,
         UpgCapacity=false, UpgHandSpeed=false, UpgHandGrab=false, UpgHandHold=false,
@@ -2290,6 +2430,8 @@ end
         "Use the existing heat-aware vacuum worker alongside pitchfork hits during Auto Boss Fight.")
     farmToggle(bossTab,"Chapter5BossAimVacuum","Aim Vacuum at Boss",
         "Keep the normal camera aimed at the current weak point or body target while boss vacuum is in range.")
+    farmToggle(bossTab,"Chapter5ReduceHitEffects","Reduce Extra Boss Hit Effects",
+        "Skip extra critical/break particle bursts and debris. Keep attack warnings, weak-point markers, damage numbers and hit markers.")
     local farmerBossStatus=bossTab:Paragraph({Title="Farmer Boss Combat Status",Desc="Auto Boss Fight is OFF"})
     local upgradeStatus=upgradesTab:Paragraph({Title="Auto Upgrade Status",Desc="Waiting for upgrade check"})
     local function spawnChapterWorker(fn)
@@ -2572,6 +2714,19 @@ end
         releaseSharedVacuum()
     end)
     do
+        local hitEffects=createBossHitEffectBudget({
+            Now=os.clock,
+            Enabled=function()return not hubUnloaded and sharedFarmState.Chapter5ReduceHitEffects==true end,
+            Module=function()
+                local gui=LocalPlayer:FindFirstChildOfClass("PlayerGui")
+                if not gui or not gui:FindFirstChild("FarmerHitMarker")then return nil end
+                local scripts=LocalPlayer:FindFirstChild("PlayerScripts")
+                local folder=scripts and scripts:FindFirstChild("FarmerBossClient")
+                return folder and folder:FindFirstChild("FarmerWeakSpot")
+            end,
+            Load=require,
+        })
+        local pendingBossStatus,nextBossStatus=nil,0
         local cachedConfigModule,cachedConfig,nextConfigRead=nil,nil,0
         farmerBoss=createFarmerBossCombat({
             Player=LocalPlayer,World=Workspace,
@@ -2597,7 +2752,7 @@ end
                 end
                 return cachedConfig
             end,
-            Status=function(text)if not hubUnloaded then farmerBossStatus:SetDesc(text)end end,
+            Status=function(text)pendingBossStatus=text end,
         })
         local aimName="BeyyCh5BossAim_"..tostring(os.clock())
         RunService:BindToRenderStep(aimName,Enum.RenderPriority.Camera.Value+20,function()
@@ -2606,13 +2761,18 @@ end
         local previous=_G.__BEYY_HUB_CLEANUP
         _G.__BEYY_HUB_CLEANUP=function()
             farmerBoss.Stop()
+            hitEffects.Stop()
             pcall(function()RunService:UnbindFromRenderStep(aimName)end)
             releaseSharedVacuum()
             if previous then pcall(previous)end
         end
         spawnChapterWorker(function()
             while not hubUnloaded do
+                pcall(hitEffects.Tick)
                 local ok,err=pcall(farmerBoss.Tick)
+                if pendingBossStatus and os.clock()>=nextBossStatus and not hubUnloaded then
+                    farmerBossStatus:SetDesc(pendingBossStatus);pendingBossStatus=nil;nextBossStatus=os.clock()+0.25
+                end
                 if not ok and not hubUnloaded then farmerBossStatus:SetDesc("Farmer boss worker error: "..tostring(err))end
                 task.wait(sharedFarmState.Chapter5AutoBossFight and 0.05 or 0.5)
             end
@@ -2672,11 +2832,11 @@ end
         local savedFarmerPose=CFrame.new(-249.708892822,5.14999771118,24.4543495178,-0.0276857335120,4.19544843311e-10,0.999616682529,3.79587810073e-8,1.00000000000,6.31613927826e-10,-0.999616682529,3.79617155488e-8,-0.0276857335120)
         local savedFarmerCamera=CFrame.new(-249.227172852,6.83330154419,24.4410076141,-0.0276869274676,-0.266504645348,0.963435947895,0.00000000000,0.963805377483,0.266606867313,-0.999616622925,0.00738152489066,-0.0266848113388)
         local savedCameraOffset=savedFarmerPose:ToObjectSpace(savedFarmerCamera)
+        local farmerViewParams=RaycastParams.new()
+        farmerViewParams.FilterType=Enum.RaycastFilterType.Exclude;farmerViewParams.IgnoreWater=true
         local function clearFarmerView(view,farmer)
-            local params=RaycastParams.new()
-            params.FilterType=Enum.RaycastFilterType.Exclude;params.IgnoreWater=true
-            params.FilterDescendantsInstances={LocalPlayer.Character,Workspace.CurrentCamera}
-            local hit=Workspace:Raycast(view.Position,view.LookVector*500,params)
+            farmerViewParams.FilterDescendantsInstances={LocalPlayer.Character,Workspace.CurrentCamera}
+            local hit=Workspace:Raycast(view.Position,view.LookVector*500,farmerViewParams)
             return hit and hit.Instance:IsDescendantOf(farmer)
         end
         local fallbackFarmerApproach=createFarmerApproach({World=Workspace,Player=LocalPlayer})
@@ -2693,11 +2853,23 @@ end
             end
             return fallbackFarmerApproach(target,root,hum,farmer,range)
         end
+        local cachedFarmerView={Until=0}
         local farmerView=createFarmerCameraLock({
             World=Workspace,Player=LocalPlayer,
             ViewPose=function(root,farmer)
                 local view=root.CFrame*savedCameraOffset
-                return clearFarmerView(view,farmer)and view or nil
+                local t=os.clock()
+                local character=LocalPlayer.Character
+                local camera=Workspace.CurrentCamera
+                local moved=not cachedFarmerView.Position or(view.Position-cachedFarmerView.Position).Magnitude>0.5
+                local turned=not cachedFarmerView.Direction or view.LookVector:Dot(cachedFarmerView.Direction)<0.995
+                if t>=cachedFarmerView.Until or moved or turned or cachedFarmerView.Farmer~=farmer
+                    or cachedFarmerView.Character~=character or cachedFarmerView.Camera~=camera then
+                    cachedFarmerView.Clear=clearFarmerView(view,farmer)
+                    cachedFarmerView.Until=t+0.1;cachedFarmerView.Position=view.Position;cachedFarmerView.Direction=view.LookVector
+                    cachedFarmerView.Farmer=farmer;cachedFarmerView.Character=character;cachedFarmerView.Camera=camera
+                end
+                return cachedFarmerView.Clear and view or nil
             end,
             Shared=function()return ReplicatedStorage:FindFirstChild("NeedleHaystack")end,
             Enabled=function()return not hubUnloaded and sharedFarmState.AutoBringPotion==true and hubWindow.Closed==true end,
@@ -3168,30 +3340,20 @@ local function launchCutsceneBypass()
             if saved[key] == nil then saved[key] = previous end
             pcall(function() inst[key] = 1 end)
         end
+        local finalVisualIndex=createOverlayMaskIndex({
+            IsOverlay=isFinalOverlay,Mask=maskFinalProperty,
+            Restore=function(object)
+                local saved=finalVisualBefore[object]
+                finalVisualBefore[object]=nil
+                if saved and object.Parent then for key,value in pairs(saved)do pcall(function()object[key]=value end)end end
+            end,
+        })
         local function hideFinalCutsceneVisuals()
             if not finalVisualsEnabled or not scene then return end
-            local pg = player:FindFirstChildOfClass("PlayerGui")
-            if not pg then return end
-            for _, gui in ipairs(pg:GetChildren()) do
-                if isFinalOverlay(gui) then
-                    for _, el in ipairs(gui:GetDescendants()) do
-                        if el:IsA("GuiObject") then
-                            maskFinalProperty(el, "BackgroundTransparency")
-                            if el:IsA("TextLabel") or el:IsA("TextButton") or el:IsA("TextBox") then
-                                maskFinalProperty(el, "TextTransparency")
-                                maskFinalProperty(el, "TextStrokeTransparency")
-                            end
-                            if el:IsA("ImageLabel") or el:IsA("ImageButton") then
-                                maskFinalProperty(el, "ImageTransparency")
-                            end
-                        elseif el:IsA("UIStroke") then
-                            maskFinalProperty(el, "Transparency")
-                        end
-                    end
-                end
-            end
+            finalVisualIndex.Bind(player:FindFirstChildOfClass("PlayerGui"))
         end
         local function restoreFinalCutsceneVisuals()
+            finalVisualIndex.Clear()
             for inst, props in pairs(finalVisualBefore) do
                 if inst.Parent then
                     for key, original in pairs(props) do
@@ -3895,5 +4057,6 @@ end
     end)
     print("[BeyyHub] v103.00 " .. BEYY_CHAPTER .. " module loaded (RightControl to open)")
 end
+
 
 
