@@ -5497,72 +5497,60 @@ end
 
 do
 (function()
+    local HAND_IN_INTERVAL=0.375
+    -- Farmer-relative position verified by the controlled hand-in tests.
+    local FARMER_APPROACH=Vector3.new(-1.327728271484375,-0.3000001907348633,-3.909820556640625)
     local nextRequest=0
     local settleUntil=0
     local positioned=false
     local character
-    -- Track a real torso part; the Farmer's head can disappear while carrying the needle.
-    local cameraAimName="BeyyCh1FarmerTorsoAim_"..tostring(LocalPlayer.UserId)
-    local cameraAimBound=false
-    local function stopFarmerCameraAim()
-        if not cameraAimBound then return end
-        RunService:UnbindFromRenderStep(cameraAimName)
-        cameraAimBound=false
-    end
-    local function startFarmerCameraAim()
-        if cameraAimBound then return end
-        RunService:BindToRenderStep(cameraAimName,Enum.RenderPriority.Last.Value+35,function()
-            if Unloaded or not IN_GAME or not State.__NeedleController.Owns()
-                or not (State.AutoHandInNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared))
-                or needlePickupActive or roundEndingVisible()
-                or LocalPlayer:GetAttribute("NeedleOwned")~=true
-                or LocalPlayer:GetAttribute("NeedleRoundComplete")==true
-                or LocalPlayer:GetAttribute("CutsceneActive")==true then
-                stopFarmerCameraAim()
-                return
-            end
-            local npcs=Workspace:FindFirstChild("NPC")
-            local farmer=npcs and npcs:FindFirstChild("Farmer_NPC")
-            local root=getHRP()
-            local cam=Workspace.CurrentCamera
-            if not farmer or not root or not cam then return end
-            local torso=farmer:FindFirstChild("UpperTorso") or farmer:FindFirstChild("Torso")
-                or farmer:FindFirstChild("LowerTorso") or farmer:FindFirstChild("HumanoidRootPart")
-            local focus=torso and torso:IsA("BasePart") and torso.Position or farmer:GetPivot().Position
-            local cameraAt=root.Position-root.CFrame.LookVector*6+Vector3.new(0,2.8,0)
-            if (focus-cameraAt).Magnitude>0.25 then
-                cam.CFrame=CFrame.lookAt(cameraAt,focus,Vector3.yAxis)
-            end
-        end)
-        cameraAimBound=true
-    end
+    local serverConfirmed=false
     local function handInTick()
         if Unloaded or not IN_GAME or not State.__NeedleController.Owns()then return end
-        if not (State.AutoHandInNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) or needlePickupActive or roundEndingVisible() then return end
-        if LocalPlayer:GetAttribute("NeedleOwned")~=true then nextRequest=0;settleUntil=0;positioned=false;character=nil;return end
+        if LocalPlayer:GetAttribute("NeedleOwned")~=true then
+            nextRequest=0;settleUntil=0;positioned=false;character=nil;serverConfirmed=false
+            return
+        end
+        if serverConfirmed or LocalPlayer:GetAttribute("NeedleRoundComplete")==true then return end
+        if not (State.AutoHandInNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared))
+            or needlePickupActive or roundEndingVisible() then return end
         local root=getHRP()
         local npc=Workspace:FindFirstChild("NPC")
         local farmer=npc and npc:FindFirstChild("Farmer_NPC")
         if not root or not farmer then return end
         if character~=LocalPlayer.Character then character=LocalPlayer.Character;positioned=false end
         local t=os.clock()
-        if not positioned or (root.Position-farmer:GetPivot().Position).Magnitude>8 then
-            root.CFrame=farmer:GetPivot()*CFrame.new(0,0,4)
+        local farmerPivot=farmer:GetPivot()
+        if not positioned or (root.Position-farmerPivot.Position).Magnitude>8 then
+            local target=farmerPivot:PointToWorldSpace(FARMER_APPROACH)
+            -- Preserve character rotation; let the normal camera follow without aiming it.
+            root.CFrame=CFrame.new(target)*root.CFrame.Rotation
             root.AssemblyLinearVelocity=Vector3.zero
             root.AssemblyAngularVelocity=Vector3.zero
-            positioned=true;settleUntil=t+0.20
-            startFarmerCameraAim()
+            positioned=true;settleUntil=t+HAND_IN_INTERVAL
             return
         end
-        if LocalPlayer:GetAttribute("CutsceneActive")~=true and LocalPlayer:GetAttribute("NeedleRoundComplete")~=true then startFarmerCameraAim() end
         if t<settleUntil or t<nextRequest then return end
-        nextRequest=t+0.25
-        if not Unloaded and (State.AutoHandInNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) and LocalPlayer:GetAttribute("NeedleOwned")==true then
+        nextRequest=t+HAND_IN_INTERVAL
+        if not Unloaded and State.__NeedleController.Owns()
+            and not serverConfirmed and LocalPlayer:GetAttribute("NeedleRoundComplete")~=true
+            and LocalPlayer:GetAttribute("NeedleOwned")==true then
             pcall(function() NeedleHandIn:FireServer() end)
         end
     end
     local connection=RunService.Heartbeat:Connect(handInTick)
-    State.__NeedleController.AddCleanup(function()connection:Disconnect();stopFarmerCameraAim()end)
+    local completionRemote=NeedleHaystack and NeedleHaystack:FindFirstChild("NeedleRoundCompleted")
+    local completionConnection
+    if completionRemote and completionRemote:IsA("RemoteEvent") then
+        completionConnection=completionRemote.OnClientEvent:Connect(function()
+            serverConfirmed=true
+        end)
+    end
+    local function cleanupHandIn()
+        connection:Disconnect()
+        if completionConnection then completionConnection:Disconnect() end
+    end
+    State.__NeedleController.AddCleanup(cleanupHandIn)
     local function retireDuplicates()
         local count=State.__NeedleController.RetireLegacy(handInTick)
         if count>0 then print("[Needle] Retired "..count.." duplicate legacy hand-in controller(s)")end
@@ -5572,8 +5560,7 @@ do
     task.delay(2,retireDuplicates);task.delay(8,retireDuplicates)
     local previousCleanup=_G.__BEYY_HUB_CLEANUP
     _G.__BEYY_HUB_CLEANUP=function()
-        connection:Disconnect()
-        stopFarmerCameraAim()
+        cleanupHandIn()
         if previousCleanup then pcall(previousCleanup) end
     end
 end)()
