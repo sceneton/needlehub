@@ -436,49 +436,188 @@ end
 -- Opt-in local traces. Never issues gameplay requests or input.
 local function createChapter5GrassVisibility(world)
     local api={}
-    local enabled,alive=false,true
-    local hidden={}
-    local added
-    -- Verified decorative meshes from Chapter 5. Never match collectible hay by name.
+    local alive,grass,scenery=true,false,false
+    local roots,hidden,connections={},{},{}
+    local generation=0
     local assets={
         ["103217178175958"]=true,["102928738001465"]=true,["127886107848822"]=true,
         ["104323643416798"]=true,["110445097892661"]=true,["93443489140535"]=true,
         ["85884435633156"]=true,["77697391368219"]=true,["77965045617364"]=true,
     }
-    local function hide(obj)
-        if not alive or not enabled or hidden[obj]or not obj:IsA("MeshPart")then return end
-        if not obj.Name:lower():match("^grass")or not assets[tostring(obj.MeshId):match("%d+$")]then return end
-        if obj:GetAttribute("HayId")or obj:GetAttribute("GemId")then return end
-        hidden[obj]={Transparency=obj.LocalTransparencyModifier,Shadow=obj.CastShadow}
-        obj.LocalTransparencyModifier=1;obj.CastShadow=false
+    -- Gameplay roots are pruned before discovery, including the very large hay folders.
+    local gameplay={Camera=true,Terrain=true,NPC=true,RelicTablets=true,Sundial=true,SellModel=true,BarnShop=true,
+        BreakableFences=true,Gate=true,InvisibleBorders=true,EndCutscenePath=true,BarnIntro=true,PotionScene=true,
+        HaystackClient=true,HaystackCollision=true,DroppedHay=true,GemsClient=true,NeedleObjectiveServer=true,
+        HiddenNeedleClient=true,HeldHayClient=true,LiveTnt=true,HayDrones=true,HayPets=true,Local=true}
+    local structural={"house","barn","building","wall","roof","floor","ground","road","gate","fence",
+        "door","bridge","stair","platform","shed","silo","tower","vehicle","truck","car","windmill"}
+    local gameplayWords={"boss","weakpoint","attack","hazard","projectile","trigger","hitbox","telegraph",
+        "warning","snare","tablet","pickup","needle","potion","crank","portal","spawn","checkpoint",
+        "ladder","button","lever","switch","objective","sell","shop","waypoint","zone","seat"}
+    local identityAttributes={HayId=true,GemId=true,Ring=true,Revealed=true,Taken=true,Placed=true,BossWeakPoint=true}
+    local function rootOf(obj)
+        local node=obj
+        while node and node.Parent~=world do node=node.Parent end
+        return node
     end
-    function api.SetEnabled(value)
-        value=alive and value==true
-        if enabled==value then return end
-        enabled=value
-        if added then added:Disconnect();added=nil end
-        if not enabled then
-            for obj,saved in pairs(hidden)do
-                pcall(function()obj.LocalTransparencyModifier=saved.Transparency;obj.CastShadow=saved.Shadow end)
-            end
-            table.clear(hidden);return
+    local function excluded(root)
+        local name=root.Name
+        return gameplay[name]or name:find("Boss",1,true)or name:find("Effects",1,true)
+            or name:find("ViewClient",1,true)or name:find("Debris",1,true)
+            or name:find("Trigger",1,true)or name:find("Hitbox",1,true)
+    end
+    local function isGrass(obj)
+        return obj:IsA("MeshPart")and obj.Name:lower():match("^grass")
+            and assets[tostring(obj.MeshId):match("%d+$")]==true
+    end
+    local function restore(obj)
+        local saved=hidden[obj];if not saved then return end
+        hidden[obj]=nil
+        pcall(function()obj.LocalTransparencyModifier=saved.Transparency;obj.CastShadow=saved.Shadow end)
+        for decal,value in pairs(saved.Decals)do pcall(function()decal.Transparency=value end)end
+    end
+    local function conceal(obj)
+        if not hidden[obj]then
+            hidden[obj]={Transparency=obj.LocalTransparencyModifier,Shadow=obj.CastShadow,Decals={}}
         end
-        added=world.DescendantAdded:Connect(hide)
-        -- Hay folders can be enormous. Discover only the map decorations and direct assets.
+        local saved=hidden[obj]
+        obj.LocalTransparencyModifier=1;obj.CastShadow=false
+        for _,child in ipairs(obj:GetChildren())do
+            if child:IsA("Decal")or child:IsA("Texture")then
+                if saved.Decals[child]==nil then saved.Decals[child]=child.Transparency end
+                child.Transparency=1
+            end
+        end
+    end
+    local function releaseRoot(root)
+        local entry=roots[root];if not entry then return end
+        roots[root]=nil;entry.Alive=false
+        for _,c in ipairs(entry.Connections)do c:Disconnect()end
+        for _,c in pairs(entry.Watched)do c:Disconnect()end
+        for obj in pairs(entry.Parts)do restore(obj)end
+    end
+    local queueRoot
+    local function refresh(root,entry)
+        if not alive or not(grass or scenery)or roots[root]~=entry or root.Parent~=world then return end
+        local token=generation
+        local nodes={root}
+        for _,obj in ipairs(root:GetDescendants())do nodes[#nodes+1]=obj end
+        local protected={}
+        local function protect(obj)
+            local part,model,node=nil,nil,obj
+            while node and node~=world do
+                if not part and node:IsA("BasePart")then part=node end
+                if node:IsA("Model")then model=node;break end
+                node=node.Parent
+            end
+            protected[model or part or obj]=true
+        end
         local started=os.clock()
-        for _,obj in ipairs(world:GetChildren())do
-            if not enabled then return end
-            hide(obj)
-            if obj.Name=="Map"or obj.Name=="SundialRuins"or obj.Name=="GraveyardMap"then
-                for i,desc in ipairs(obj:GetDescendants())do
-                    if not enabled then return end
-                    hide(desc)
-                    if i%64==0 and os.clock()-started>=0.001 then task.wait();started=os.clock()end
+        for i,obj in ipairs(nodes)do
+            if not alive or token~=generation or roots[root]~=entry then return end
+            if obj:IsA("ProximityPrompt")or obj:IsA("ClickDetector")or obj:IsA("TouchTransmitter")
+                or obj:IsA("Humanoid")or obj:IsA("Tool")or obj:IsA("Script")or obj:IsA("LocalScript")
+                or obj:IsA("SurfaceGui")or obj:IsA("BillboardGui")then protect(obj)end
+            if obj:IsA("BasePart")then
+                for _,name in ipairs({"HayId","GemId","Ring","Revealed","Taken","Placed","BossWeakPoint"})do
+                    if obj:GetAttribute(name)~=nil then protect(obj);break end
                 end
             end
+            if i%64==0 and os.clock()-started>=0.001 then task.wait();started=os.clock()end
         end
+        local previous=entry.Parts;local parts={}
+        local function guarded(obj)
+            local node=obj
+            while node and node~=world do
+                if protected[node]then return true end
+                local lower=node.Name:lower()
+                for _,word in ipairs(gameplayWords)do if lower:find(word,1,true)then return true end end
+                -- Preserve structural models, even when some facade pieces have CanCollide off.
+                if node:IsA("Model")or node:IsA("BasePart")then
+                    for _,word in ipairs(structural)do if lower:find(word,1,true)then return true end end
+                end
+                node=node.Parent
+            end
+            return false
+        end
+        for i,obj in ipairs(nodes)do
+            if not alive or token~=generation or roots[root]~=entry then return end
+            if obj:IsA("BasePart")and obj:IsDescendantOf(world)then
+                parts[obj]=true
+                if not entry.Watched[obj]then
+                    local function propertyChanged()
+                        -- Reveal a newly solid object immediately; recompute its eligibility afterwards.
+                        if obj.CanCollide then restore(obj)end
+                        queueRoot(root)
+                    end
+                    local collision=obj:GetPropertyChangedSignal("CanCollide"):Connect(propertyChanged)
+                    local anchored=obj:GetPropertyChangedSignal("Anchored"):Connect(propertyChanged)
+                    local attributes=obj.AttributeChanged:Connect(function(name)
+                        if identityAttributes[name]then restore(obj);queueRoot(root)end
+                    end)
+                    entry.Watched[obj]={Disconnect=function()collision:Disconnect();anchored:Disconnect();attributes:Disconnect()end}
+                end
+                local safe=not guarded(obj)
+                if safe and((grass and isGrass(obj))or(scenery and obj.CanCollide==false and obj.Anchored))then conceal(obj)
+                else restore(obj)end
+            end
+            if i%64==0 and os.clock()-started>=0.001 then task.wait();started=os.clock()end
+        end
+        for obj in pairs(previous)do if not parts[obj]then restore(obj)end end
+        for obj,c in pairs(entry.Watched)do if not parts[obj]then c:Disconnect();entry.Watched[obj]=nil end end
+        entry.Parts=parts
     end
-    function api.Stop()api.SetEnabled(false);alive=false end
+    queueRoot=function(root)
+        if not alive or not(grass or scenery)or not root or root.Parent~=world or excluded(root)then return end
+        local entry=roots[root]
+        if not entry then entry={Parts={},Watched={},Connections={},Alive=true};roots[root]=entry end
+        entry.Dirty=true
+        if entry.Queued then return end
+        entry.Queued=true
+        task.defer(function()
+            while alive and roots[root]==entry and entry.Dirty and(grass or scenery)do
+                entry.Dirty=false
+                local ok,err=pcall(refresh,root,entry)
+                if not ok then warn("[BeyyHub scenery] "..tostring(err))end
+            end
+            entry.Queued=false
+        end)
+    end
+    local function disconnect()
+        for _,c in ipairs(connections)do c:Disconnect()end;table.clear(connections)
+        for root,entry in pairs(roots)do
+            releaseRoot(root)
+        end
+        for obj in pairs(hidden)do restore(obj)end
+    end
+    local function changed()
+        generation+=1
+        if not(grass or scenery)then disconnect();return end
+        if #connections==0 then
+            connections[1]=world.DescendantAdded:Connect(function(obj)queueRoot(rootOf(obj))end)
+            connections[2]=world.DescendantRemoving:Connect(function(obj)
+                local root=rootOf(obj)
+                -- Restore before an object can leave a decorative hierarchy for a gameplay one.
+                restore(obj)
+                if obj==root then
+                    releaseRoot(root)
+                else queueRoot(root)end
+            end)
+        end
+        for _,root in ipairs(world:GetChildren())do queueRoot(root)end
+    end
+    function api.SetEnabled(value)
+        value=alive and value==true;if grass==value then return end
+        grass=value;changed()
+    end
+    function api.SetScenery(value)
+        value=alive and value==true;if scenery==value then return end
+        scenery=value;changed()
+    end
+    function api.Stop()
+        if not alive then return end
+        grass=false;scenery=false;alive=false;generation+=1;disconnect()
+    end
     return api
 end
 
@@ -2510,7 +2649,7 @@ end
         return(tabletController and tabletController.IsBusy())or(sundialController and sundialController.IsBusy())or(potionController and potionController.IsBusy())or false
     end
     local sharedFarmDefaults = {
-        HideDecorativeGrass=false, AutoPickHay=false, AutoCollectDroppedHay=false, AutoCollectGems=false, CollectInterval=0.5,
+        HideNonSolidScenery=false, HideDecorativeGrass=false, AutoPickHay=false, AutoCollectDroppedHay=false, AutoCollectGems=false, CollectInterval=0.5,
         AutoSellHay=false, SellThreshold=25, SellOnlyIfFull=false,
         AutoUseTNT=false, AutoUsePitchfork=false, AutoDeployDrone=false,
         TntLightCooldown=0, TntThrowDelay=0.4,
@@ -2621,7 +2760,16 @@ end
                 grassVisibility.SetEnabled(enabled)
             end,
         })
+        Registry.HideNonSolidScenery=overviewTab:Toggle({Title="Hide Non-Solid Scenery",Value=sharedFarmState.HideNonSolidScenery,
+            Desc="Hide non-colliding scenery. Keep solid structures, detected interactions, characters and gameplay warnings visible. Switch off to restore.",
+            Callback=function(enabled)
+                sharedFarmState.HideNonSolidScenery=enabled==true
+                saveSharedFarmSettings()
+                grassVisibility.SetScenery(enabled)
+            end,
+        })
         grassVisibility.SetEnabled(sharedFarmState.HideDecorativeGrass)
+        grassVisibility.SetScenery(sharedFarmState.HideNonSolidScenery)
         local previous=_G.__BEYY_HUB_CLEANUP
         _G.__BEYY_HUB_CLEANUP=function()
             grassVisibility.Stop()
