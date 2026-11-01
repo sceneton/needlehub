@@ -2,12 +2,12 @@
 local function createNeedleLatencyRecorder(options)
     local api={};local alive=true;local sequence=0;local ring={};local pending={};local cycles={};local cycle
     local counters={};local lastSnapshot;local cycleNumber=0
-    function api.Record(kind,data)
+    function api.Record(kind,data,at)
         if not alive then return end
         local ok,clean=pcall(options.Serialize,data or{})
         if not ok then return end
         sequence+=1;counters[kind]=(counters[kind]or 0)+1
-        local event={SessionId=options.SessionId,Sequence=sequence,At=options.Now(),WallTimeMs=options.WallTimeMs(),
+        local event={SessionId=options.SessionId,Sequence=sequence,At=at or options.Now(),WallTimeMs=options.WallTimeMs(),
             PlaceId=options.PlaceId,Kind=kind,Data=clean}
         ring[#ring+1]=event;if #ring>512 then table.remove(ring,1)end
         pending[#pending+1]=event
@@ -20,9 +20,9 @@ local function createNeedleLatencyRecorder(options)
         cycles[#cycles+1]=cycle;if #cycles>32 then table.remove(cycles,1)end
         return cycle
     end
-    local function stamp(key)
+    local function stamp(key,at)
         local current=cycle or begin("Started without observing exposure")
-        current.Times[key]=current.Times[key]or options.Now()
+        current.Times[key]=current.Times[key]or at or options.Now()
         local times=current.Times
         if times.Exposed and times.FirstPickupRequest then current.ExposureToPickupRequestMs=(times.FirstPickupRequest-times.Exposed)*1000 end
         if times.FirstPickupRequest and times.OwnershipObserved then current.PickupRequestToOwnershipMs=(times.OwnershipObserved-times.FirstPickupRequest)*1000 end
@@ -47,13 +47,13 @@ local function createNeedleLatencyRecorder(options)
             api.Record("OwnershipCleared",{Timings=cycle})
         end
     end
-    function api.Request(kind,data)
+    function api.Request(kind,data,at)
         if not alive then return end
         local current
-        if kind=="Pickup"then current=stamp("FirstPickupRequest");current.PickupRequests+=1
-        elseif kind=="HandIn"then current=stamp("FirstHandInRequest");current.HandInRequests+=1
+        if kind=="Pickup"then current=stamp("FirstPickupRequest",at);current.PickupRequests+=1
+        elseif kind=="HandIn"then current=stamp("FirstHandInRequest",at);current.HandInRequests+=1
         elseif kind=="MousePress"then current=cycle;if current then current.MousePressAttempts+=1 end end
-        api.Record(kind.."Attempt",{Details=data,Timings=current})
+        api.Record(kind.."Attempt",{Details=data,Timings=current},at)
     end
     function api.RoundComplete()
         if not alive then return end
@@ -80,7 +80,7 @@ end
 
 -- Standalone observer: does not issue gameplay requests, clicks, teleports or attribute writes.
 local ROOT="BeyyHub"
-local RECORDER_VERSION="2"
+local RECORDER_VERSION="3"
 local SOURCE_URL="https://raw.githubusercontent.com/sceneton/needlehub/main/needle-latency-diagnostics.lua"
 local CACHE_PATH=ROOT.."/needle_latency_recorder.lua"
 local ENABLED_PATH=ROOT.."/needle_latency_enabled.txt"
@@ -300,16 +300,26 @@ if type(interceptor)~="table"or interceptor.JobId~=game.JobId or interceptor.Pla
     else interceptor.Error="Namecall observation is unavailable in this executor"end
 end
 run.Hooks.NamecallInstalled=interceptor.Installed==true;run.Hooks.NamecallError=interceptor.Error
-interceptor.Observe=function(remote,method,...)
+run.Hooks.LoggingMode="Deferred: original namecall forwards before observation"
+local function processObservation(remote,method,args,capturedAt)
     if not run.Running then return end
-    local args=table.pack(...)
+    local data={Remote=remote,Arguments=args,SnapshotDelayMs=(now()-capturedAt)*1000}
     if method=="FireServer"and remote==pickRemote and(args[1]=="Objective"or exposed and args[1]==exposed:GetAttribute("HayId"))then
-        recorder.Request("Pickup",{Remote=remote,Arguments=args,State=snapshot(true)})
+        data.State=snapshot(true);recorder.Request("Pickup",data,capturedAt)
     elseif method=="FireServer"and remote==handInRemote then
-        recorder.Request("HandIn",{Remote=remote,Arguments=args,State=snapshot(false)})
+        data.State=snapshot(false);recorder.Request("HandIn",data,capturedAt)
     elseif remote==Input and method=="SendMouseButtonEvent"and(exposed or player:GetAttribute("NeedleOwned")==true)then
-        recorder.Request(args[4]and "MousePress"or "MouseRelease",{X=args[1],Y=args[2],Button=args[3],State=snapshot(false)})
+        data.X=args[1];data.Y=args[2];data.Button=args[3];data.State=snapshot(false)
+        recorder.Request(args[4]and "MousePress"or "MouseRelease",data,capturedAt)
     end
+end
+interceptor.Observe=function(remote,method,...)
+    -- No Instance methods, serialization, debug inspection or disk writes in __namecall.
+    -- Those can change Roblox's active namecall method before original(self, ...) runs.
+    local args=table.pack(...);local capturedAt=now()
+    task.defer(function()local ok,err=pcall(processObservation,remote,method,args,capturedAt)
+        if not ok then record("DeferredObserverError",{Error=tostring(err)})end
+    end)
 end
 local function bindRemoteObserver()refreshRemotes();interceptor.Pick=pickRemote;interceptor.Hand=handInRemote end
 persistEnabled(true)
