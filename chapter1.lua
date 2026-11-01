@@ -5174,7 +5174,7 @@ do
             return
         end
         if t<settleUntil or t<nextRequest then return end
-        nextRequest=t+1.2
+        nextRequest=t+0.25
         if not Unloaded and (State.AutoHandInNeedle or State.AutoFarmWins or (State.AutoFarmHay and State.HayFarmCleared)) and LocalPlayer:GetAttribute("NeedleOwned")==true then
             pcall(function() NeedleHandIn:FireServer() end)
         end
