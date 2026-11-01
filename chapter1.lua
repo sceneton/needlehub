@@ -1140,11 +1140,11 @@ local function createAutoUpgradeRuntime(options)
     local tracks = {
         {"UpgVacPower","VacuumPower"},{"UpgVacCooling","VacuumCooling"},
         {"UpgVacRuntime","VacuumRuntime"},
-        {"UpgTntPower","TntPower"},{"UpgTntLuck","TntLuck"},
+        {"UpgTntCooldown","TntCooldown"},{"UpgTntLuck","TntLuck"},
         {"UpgCapacity","Capacity"},{"UpgHandSpeed","Speed"},{"UpgHandGrab","Grab"},{"UpgHandHold","HandHold"},
         {"UpgPitchCooldown","PitchforkCooldown"},{"UpgPitchHold","PitchforkHold"},{"UpgPitchSweep","Pitchfork"},
         {"UpgDroneSpeed","DroneSpeed"},{"UpgDroneGrab","DroneGrab"},{"UpgDroneCapacity","DroneCapacity"},
-        {"UpgTntCooldown","TntCooldown"},
+        {"UpgTntPower","TntPower"},
     }
     local lastStatus
     local function status(text)
@@ -1193,7 +1193,7 @@ local function createAutoUpgradeRuntime(options)
                 local price=nextLevel and cost(entry[2],nextLevel)
                 if price then
                     local target={Flag=entry[1],Name=entry[2],Level=current,Cost=price}
-                    if entry[2]=="TntCooldown" then
+                    if entry[2]=="TntPower" then
                         -- Tracks start at L1: two purchases reach L3.
                         if current<3 then earlyTnt=target else lateTnt=target end
                     else
