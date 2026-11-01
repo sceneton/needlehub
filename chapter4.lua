@@ -2066,6 +2066,259 @@ end
         Registry[key] = element
         return element
     end
+do
+    (function(tab,registry,isRunning)
+local function createSceneryVisibility(world)
+    local api={}
+    local alive,grass,scenery=true,false,false
+    local roots,hidden,connections={},{},{}
+    local generation=0
+    local assets={
+        ["103217178175958"]=true,["102928738001465"]=true,["127886107848822"]=true,
+        ["104323643416798"]=true,["110445097892661"]=true,["93443489140535"]=true,
+        ["85884435633156"]=true,["77697391368219"]=true,["77965045617364"]=true,
+    }
+    -- Gameplay roots are pruned before discovery, including the very large hay folders.
+    local gameplay={Camera=true,Terrain=true,NPC=true,RelicTablets=true,Sundial=true,SellModel=true,BarnShop=true,
+        BreakableFences=true,Gate=true,InvisibleBorders=true,EndCutscenePath=true,BarnIntro=true,PotionScene=true,
+        HaystackClient=true,HaystackCollision=true,DroppedHay=true,GemsClient=true,NeedleObjectiveServer=true,
+        HiddenNeedleClient=true,HeldHayClient=true,LiveTnt=true,HayDrones=true,HayPets=true,Local=true,
+        Puzzles=true,HayCandles=true,WhereToPlaceCandles=true,Leaderboards=true}
+    local structural={"house","barn","building","wall","roof","floor","ground","road","gate","fence",
+        "door","bridge","stair","platform","shed","silo","tower","vehicle","truck","car","windmill"}
+    local gameplayWords={"boss","weakpoint","attack","hazard","projectile","trigger","hitbox","telegraph",
+        "warning","snare","tablet","pickup","needle","potion","crank","portal","spawn","checkpoint",
+        "ladder","button","lever","switch","objective","sell","shop","waypoint","zone","seat",
+        "candle","key","paper","puzzle","ufo","vent","laser","barrier","reward","quest"}
+    local identityAttributes={HayId=true,GemId=true,Ring=true,Revealed=true,Taken=true,Placed=true,BossWeakPoint=true,
+        CandleId=true,KeyId=true,PaperId=true,UfoId=true,UFOId=true,PuzzleId=true,Interactable=true}
+    local function rootOf(obj)
+        local node=obj
+        while node and node.Parent~=world do node=node.Parent end
+        return node
+    end
+    local function excluded(root)
+        local name=root.Name;local lower=name:lower()
+        return gameplay[name]or lower:find("boss",1,true)or lower:find("effects",1,true)
+            or lower:find("viewclient",1,true)or lower:find("debris",1,true)
+            or lower:find("trigger",1,true)or lower:find("hitbox",1,true)
+    end
+    local function isGrass(obj)
+        if obj:IsA("MeshPart")and assets[tostring(obj.MeshId):match("%d+$")]then return true end
+        -- Other chapters can use different grass assets and nested grass models.
+        local node=obj
+        while node and node~=world do
+            local name=node.Name:lower()
+            if name=="grass"or name:match("^grass[%W_%d]")or name:match("^grasspatch")
+                or name:match("^grasstuft")or name:match("^grassclump")then return true end
+            node=node.Parent
+        end
+        return false
+    end
+    local function restore(obj)
+        local saved=hidden[obj];if not saved then return end
+        hidden[obj]=nil
+        pcall(function()obj.LocalTransparencyModifier=saved.Transparency;obj.CastShadow=saved.Shadow end)
+        for decal,value in pairs(saved.Decals)do pcall(function()decal.Transparency=value end)end
+    end
+    local function conceal(obj)
+        if not hidden[obj]then
+            hidden[obj]={Transparency=obj.LocalTransparencyModifier,Shadow=obj.CastShadow,Decals={}}
+        end
+        local saved=hidden[obj]
+        obj.LocalTransparencyModifier=1;obj.CastShadow=false
+        for _,child in ipairs(obj:GetChildren())do
+            if child:IsA("Decal")or child:IsA("Texture")then
+                if saved.Decals[child]==nil then saved.Decals[child]=child.Transparency end
+                child.Transparency=1
+            end
+        end
+    end
+    local function releaseRoot(root)
+        local entry=roots[root];if not entry then return end
+        roots[root]=nil;entry.Alive=false
+        for _,c in ipairs(entry.Connections)do c:Disconnect()end
+        for _,c in pairs(entry.Watched)do c:Disconnect()end
+        for obj in pairs(entry.Parts)do restore(obj)end
+    end
+    local queueRoot
+    local function refresh(root,entry)
+        if not alive or not(grass or scenery)or roots[root]~=entry or root.Parent~=world then return end
+        local token=generation
+        local nodes={root}
+        for _,obj in ipairs(root:GetDescendants())do nodes[#nodes+1]=obj end
+        local protected={}
+        local function protect(obj)
+            local part,model,node=nil,nil,obj
+            while node and node~=world do
+                if not part and node:IsA("BasePart")then part=node end
+                if node:IsA("Model")and(node~=root or obj:IsA("Humanoid")or obj:IsA("Tool"))then model=node;break end
+                node=node.Parent
+            end
+            protected[model or part or obj]=true
+        end
+        local started=os.clock()
+        for i,obj in ipairs(nodes)do
+            if not alive or token~=generation or roots[root]~=entry then return end
+            if obj:IsA("ProximityPrompt")or obj:IsA("ClickDetector")or obj:IsA("TouchTransmitter")
+                or obj:IsA("Humanoid")or obj:IsA("Tool")or obj:IsA("Script")or obj:IsA("LocalScript")
+                or obj:IsA("SurfaceGui")or obj:IsA("BillboardGui")then protect(obj)end
+            if obj:IsA("BasePart")or obj:IsA("Model")then
+                for name in pairs(identityAttributes)do
+                    if obj:GetAttribute(name)~=nil then protect(obj);break end
+                end
+            end
+            if i%64==0 and os.clock()-started>=0.001 then task.wait();started=os.clock()end
+        end
+        local previous=entry.Parts;local parts={}
+        local function guarded(obj)
+            local node=obj
+            while node and node~=world do
+                if protected[node]then return true end
+                local lower=node.Name:lower()
+                for _,word in ipairs(gameplayWords)do if lower:find(word,1,true)then return true end end
+                -- Preserve structural models, even when some facade pieces have CanCollide off.
+                if node:IsA("Model")or node:IsA("BasePart")then
+                    for _,word in ipairs(structural)do if lower:find(word,1,true)then return true end end
+                end
+                node=node.Parent
+            end
+            return false
+        end
+        for i,obj in ipairs(nodes)do
+            if not alive or token~=generation or roots[root]~=entry then return end
+            if obj:IsA("BasePart")and obj:IsDescendantOf(world)then
+                parts[obj]=true
+                if not entry.Watched[obj]then
+                    local function propertyChanged()
+                        -- Reveal a newly solid object immediately; recompute its eligibility afterwards.
+                        if obj.CanCollide then restore(obj)end
+                        queueRoot(root)
+                    end
+                    local collision=obj:GetPropertyChangedSignal("CanCollide"):Connect(propertyChanged)
+                    local anchored=obj:GetPropertyChangedSignal("Anchored"):Connect(propertyChanged)
+                    local attributes=obj.AttributeChanged:Connect(function(name)
+                        if identityAttributes[name]then restore(obj);queueRoot(root)end
+                    end)
+                    entry.Watched[obj]={Disconnect=function()collision:Disconnect();anchored:Disconnect();attributes:Disconnect()end}
+                end
+                local safe=not guarded(obj)
+                if safe and((grass and isGrass(obj))or(scenery and obj.CanCollide==false and obj.Anchored))then conceal(obj)
+                else restore(obj)end
+            end
+            if i%64==0 and os.clock()-started>=0.001 then task.wait();started=os.clock()end
+        end
+        for obj in pairs(previous)do if not parts[obj]then restore(obj)end end
+        for obj,c in pairs(entry.Watched)do if not parts[obj]then c:Disconnect();entry.Watched[obj]=nil end end
+        entry.Parts=parts
+    end
+    queueRoot=function(root)
+        if not alive or not(grass or scenery)or not root or root.Parent~=world or excluded(root)then return end
+        local entry=roots[root]
+        if not entry then entry={Parts={},Watched={},Connections={},Alive=true};roots[root]=entry end
+        entry.Dirty=true
+        if entry.Queued then return end
+        entry.Queued=true
+        task.defer(function()
+            while alive and roots[root]==entry and entry.Dirty and(grass or scenery)do
+                entry.Dirty=false
+                local ok,err=pcall(refresh,root,entry)
+                if not ok then warn("[BeyyHub scenery] "..tostring(err))end
+            end
+            entry.Queued=false
+        end)
+    end
+    local function disconnect()
+        for _,c in ipairs(connections)do c:Disconnect()end;table.clear(connections)
+        for root,entry in pairs(roots)do
+            releaseRoot(root)
+        end
+        for obj in pairs(hidden)do restore(obj)end
+    end
+    local function changed()
+        generation+=1
+        if not(grass or scenery)then disconnect();return end
+        if #connections==0 then
+            connections[1]=world.DescendantAdded:Connect(function(obj)queueRoot(rootOf(obj))end)
+            connections[2]=world.DescendantRemoving:Connect(function(obj)
+                local root=rootOf(obj)
+                -- Restore before an object can leave a decorative hierarchy for a gameplay one.
+                restore(obj)
+                if obj==root then
+                    releaseRoot(root)
+                else queueRoot(root)end
+            end)
+        end
+        for _,root in ipairs(world:GetChildren())do queueRoot(root)end
+    end
+    function api.SetEnabled(value)
+        value=alive and value==true;if grass==value then return end
+        grass=value;changed()
+    end
+    function api.SetScenery(value)
+        value=alive and value==true;if scenery==value then return end
+        scenery=value;changed()
+    end
+    function api.Stop()
+        if not alive then return end
+        grass=false;scenery=false;alive=false;generation+=1;disconnect()
+    end
+    return api
+end
+
+        local visibility=createSceneryVisibility(game:GetService("Workspace"))
+        local http=game:GetService("HttpService")
+        local teleport=game:GetService("TeleportService")
+        local path=CACHE_FOLDER.."/scenery_visibility.json"
+        local teleportKey="BeyyHub_SceneryVisibility_v1"
+        local preferences={HideDecorativeGrass=false,HideNonSolidScenery=false}
+        local env=_G
+        if type(getgenv)=="function"then local ok,value=pcall(getgenv);if ok and type(value)=="table"then env=value end end
+        local function apply(data)
+            if type(data)~="table"then return end
+            data=data.__elements or data
+            for key in pairs(preferences)do
+                local value=data[key]
+                if type(value)=="table"then value=value.value end
+                if type(value)=="boolean"then preferences[key]=value end
+            end
+        end
+        local function read(path)
+            if type(readfile)~="function"then return nil end
+            local ok,value=pcall(function()return http:JSONDecode(readfile(path))end)
+            return ok and type(value)=="table"and value or nil
+        end
+        -- Migrate the existing Chapter 5 values, then prefer the shared visibility preferences.
+        apply(read(CACHE_FOLDER.."/farming_inventory_shared.json"))
+        apply(read(path));apply(env.__BEYY_SCENERY_PREFERENCES)
+        local ok,packet=pcall(teleport.GetTeleportSetting,teleport,teleportKey)
+        if ok then apply(packet)end
+        local function persist()
+            local copy={HideDecorativeGrass=preferences.HideDecorativeGrass,HideNonSolidScenery=preferences.HideNonSolidScenery}
+            env.__BEYY_SCENERY_PREFERENCES=copy
+            pcall(teleport.SetTeleportSetting,teleport,teleportKey,copy)
+            if type(writefile)=="function"then pcall(function()writefile(path,http:JSONEncode(copy))end)end
+        end
+        for _,spec in ipairs({{"HideDecorativeGrass","Hide Decorative Grass","Hide decorative grass locally. Switch off to restore."},
+            {"HideNonSolidScenery","Hide Non-Solid Scenery","Hide non-colliding scenery. Keep solid structures, detected interactions, characters and gameplay warnings visible."}})do
+            local key=spec[1]
+            registry[key]=tab:Toggle({Title=spec[2],Desc=spec[3],Value=preferences[key],Callback=function(value)
+                if not isRunning()then return end
+                preferences[key]=value==true;persist()
+                if key=="HideDecorativeGrass"then visibility.SetEnabled(preferences[key])else visibility.SetScenery(preferences[key])end
+            end})
+        end
+        visibility.SetEnabled(preferences.HideDecorativeGrass)
+        visibility.SetScenery(preferences.HideNonSolidScenery)
+        local previous=_G.__BEYY_HUB_CLEANUP
+        _G.__BEYY_HUB_CLEANUP=function()
+            visibility.Stop()
+            if previous then pcall(previous)end
+        end
+
+    end)(overviewTab,Registry,function()return not hubUnloaded end)
+end
+
     collectingTab:Section({ Title="Resource Collecting" })
     farmToggle(collectingTab,"AutoPickHay","Auto Pick Hay")
     farmToggle(collectingTab,"AutoCollectDroppedHay","Auto Collect Dropped Hay")
@@ -3656,3 +3909,4 @@ end
     end)
     print("[BeyyHub] v103.00 " .. BEYY_CHAPTER .. " module loaded (RightControl to open)")
 end
+
