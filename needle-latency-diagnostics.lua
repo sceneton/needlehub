@@ -111,6 +111,18 @@ local sessionStart=os.clock()
 local lastWorld,bytes,fallbackHistory=nil,0,nil
 local function read(path)local ok,value=pcall(readfile,path);return ok and type(value)=="string"and value or nil end
 local prior=read(LOG_PATH);bytes=prior and #prior or 0
+if not prior then
+    -- Some executors require an existing file before appendfile can be used.
+    local recovered={};local previousSummary=read(SUMMARY_PATH)
+    if previousSummary then
+        local ok,value=pcall(H.JSONDecode,H,previousSummary)
+        if ok and type(value)=="table"and type(value.Events)=="table"then
+            for _,event in ipairs(value.Events)do recovered[#recovered+1]=H:JSONEncode(event)end
+        end
+    end
+    prior=#recovered>0 and(table.concat(recovered,"\n").."\n")or""
+    pcall(writefile,LOG_PATH,prior);bytes=#prior
+end
 if type(appendfile)~="function"then fallbackHistory=prior or""end
 local function serialize(value,depth,seen)
     local kind=typeof(value)
@@ -264,6 +276,7 @@ local function refreshRemotes()
     clear(feedbackConnections);pickRemote=pick;handInRemote=hand
     for _,remote in pairs({pick,hand})do if remote and remote:IsA("RemoteEvent")then
         feedbackConnections[#feedbackConnections+1]=remote.OnClientEvent:Connect(function(...)
+            if remote==pickRemote and not exposed and player:GetAttribute("NeedleOwned")~=true then return end
             record("ObservedRemoteFeedback",{Remote=remote,Arguments=table.pack(...)})
         end)
     end end
@@ -329,7 +342,8 @@ end)
 hook(player.AttributeChanged:Connect(function(name)
     if name=="NeedleOwned"then recorder.Ownership(player:GetAttribute(name)==true,false)
     elseif name=="NeedleRoundComplete"and player:GetAttribute(name)==true then recorder.RoundComplete()
-    elseif name=="CutsceneActive"or name=="NeedleInputLocked"or name=="HintViewerOpen"or name=="HoveredHayId"then
+    elseif name=="CutsceneActive"or name=="NeedleInputLocked"or name=="HintViewerOpen"
+        or name=="HoveredHayId"and(exposed or player:GetAttribute("NeedleOwned")==true)then
         record("PlayerAttribute",{Attribute=name,Value=player:GetAttribute(name)})
     end
 end))
