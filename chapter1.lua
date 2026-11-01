@@ -1021,11 +1021,11 @@ do
                 if type(fn)=="function"then
                     local ok,constants=pcall(debug.getconstants,fn)
                     if ok then
-                        local owned,farmer,enabled=false,false,false
+                        local owned,farmer,enabled,sends=false,false,false,false
                         for _,value in pairs(constants)do
-                            if value=="NeedleOwned"then owned=true elseif value=="Farmer_NPC"then farmer=true elseif value=="AutoHandInNeedle"then enabled=true end
+                            if value=="NeedleOwned"then owned=true elseif value=="Farmer_NPC"then farmer=true elseif value=="AutoHandInNeedle"then enabled=true elseif value=="FireServer"then sends=true end
                         end
-                        if owned and farmer and enabled then
+                        if owned and farmer and enabled and sends then
                             local valid,uv=pcall(debug.getupvalues,fn)
                             if valid then
                                 local remote,state=false,nil
