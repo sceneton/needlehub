@@ -1439,6 +1439,143 @@ local function createPotionHandIn(options)
 end
 
 
+local function createFarmerBossCombat(options)
+    local api={}
+    local alive,nextSend=true,0
+    local currentBoss,currentRoot,feedback,feedbackConnection
+    local bones={}
+    local aim,config,lastStatus,lastAction=nil,nil,nil,"Waiting for active farmer boss"
+    local stats={Requests=0,Hits=0,WeakHits=0,Damage=0}
+    local excluded={Sleeping=true,Intro=true,Rising=true,Falling=true,Defeated=true,
+        PhaseTransition=true,Returning=true,Unavailable=true,Dead=true,Dying=true}
+    local function status(text)
+        lastAction=text
+        local display=text..string.format(" | requests=%d hits=%d weak=%d damage=%.1f",
+            stats.Requests,stats.Hits,stats.WeakHits,stats.Damage)
+        if display~=lastStatus then lastStatus=display;options.Status(display)end
+    end
+    local function bindFeedback()
+        local remote=options.Feedback()
+        if remote==feedback then return end
+        if feedbackConnection then feedbackConnection:Disconnect();feedbackConnection=nil end
+        feedback=remote
+        if remote and remote:IsA("RemoteEvent")then
+            feedbackConnection=remote.OnClientEvent:Connect(function(kind,userId,amount,position,tool,grade)
+                if not alive or not options.Enabled()or kind~="Hit"or userId~=options.Player.UserId
+                    or type(amount)~="number"or amount<0 or(tool~="Pitchfork"and tool~="Vacuum")then return end
+                stats.Hits+=1;stats.Damage+=amount
+                if grade=="Weak"or grade=="Break"or grade=="Critical"then stats.WeakHits+=1 end
+                status("Confirmed "..tool..": "..string.format("%.1f",amount).." damage ("..tostring(grade or "Normal")..")")
+            end)
+        end
+    end
+    function api.IsEngaged()
+        if not alive or not options.Enabled()then return false end
+        local boss=options.World:FindFirstChild("FarmerBoss")
+        local state=boss and boss:GetAttribute("BossState")
+        return boss and type(state)=="string"and state~=""and not excluded[state]
+            and boss:GetAttribute("BossHidden")~=true and boss:GetAttribute("BossInvulnerable")~=true
+            and(tonumber(boss:GetAttribute("BossHealth"))or 0)>0 or false
+    end
+    local function locked()
+        if options.Blocked()then return true,"menu, cutscene or objective interaction"end
+        for _,name in ipairs({"BossHeld","BossRagdolled","BossRagdollRecovering","BossKnockdownCamera"})do
+            if options.Player:GetAttribute(name)==true then return true,name end
+        end
+        if options.World:GetServerTimeNow()<(tonumber(options.Player:GetAttribute("BossStunnedUntil"))or 0)then return true,"stun"end
+        local char=options.Player.Character
+        local hum=char and char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health<=0 then return true,"character unavailable"end
+        return false
+    end
+    local function resolve(body,name,origin)
+        local spec=config and config.WeakPoint and config.WeakPoint.Spots and config.WeakPoint.Spots[name]
+        if type(spec)~="table"then return nil,"Unknown farmer region: "..tostring(name)end
+        local pair={}
+        for i=1,2 do
+            local bone=bones[spec[i]]
+            if not bone or not bone:IsDescendantOf(body)then
+                bone=body:FindFirstChild(spec[i],true)
+                if not bone or not bone:IsA("Bone")then return nil,"Waiting for farmer bone: "..tostring(spec[i])end
+                bones[spec[i]]=bone
+            end
+            pair[i]=bone
+        end
+        local centre=pair[1].TransformedWorldCFrame.Position:Lerp(pair[2].TransformedWorldCFrame.Position,spec[3]or 0.5)
+        local delta=origin-centre
+        if delta.Magnitude>=0.05 then
+            return centre+delta.Unit*math.min((tonumber(spec[4])or 2)+0.5,math.max(0,delta.Magnitude-1.2))
+        end
+        return centre
+    end
+    function api.CanVacuum()
+        if not aim or not config or not options.VacuumEnabled()or not api.IsEngaged()or locked()then return false end
+        local char=options.Player.Character
+        local head=char and char:FindFirstChild("Head")
+        return head and options.Player:GetAttribute("VacuumOwned")==true
+            and(aim-head.Position).Magnitude<=(tonumber(config.VacuumRange)or 14)or false
+    end
+    function api.Aim()
+        if not api.CanVacuum()or not options.AimVacuum()then return end
+        local camera=options.World.CurrentCamera
+        if camera and camera.CameraType~=Enum.CameraType.Scriptable and(aim-camera.CFrame.Position).Magnitude>=0.1 then
+            camera.CFrame=CFrame.lookAt(camera.CFrame.Position,aim)
+        end
+    end
+    function api.Stop()
+        alive=false;aim=nil;table.clear(bones)
+        if feedbackConnection then feedbackConnection:Disconnect();feedbackConnection=nil end
+    end
+    function api.Tick()
+        if not alive then return end
+        bindFeedback();aim=nil
+        if not options.Enabled()then status("Auto Boss Fight is OFF");return end
+        if not api.IsEngaged()then status("Waiting for active farmer boss");return end
+        local blocked,reason=locked()
+        if blocked then status("Paused: "..reason);return end
+        config=options.Config()
+        if type(config)~="table"or type(config.WeakPoint)~="table"then status("Waiting for FarmerBoss configuration");return end
+        local boss=options.World:FindFirstChild("FarmerBoss")
+        local body=boss and boss:FindFirstChild("RootPart")
+        if not body then status("Waiting for farmer body");return end
+        if boss~=currentBoss or body~=currentRoot then
+            currentBoss,currentRoot=boss,body;table.clear(bones);nextSend=0
+            stats.Requests=0;stats.Hits=0;stats.WeakHits=0;stats.Damage=0
+        end
+        local head=options.Player.Character:FindFirstChild("Head")
+        if not head then status("Waiting for character head");return end
+        local now=options.World:GetServerTimeNow()
+        local name=boss:GetAttribute("BossWeakPoint")
+        local ends=tonumber(boss:GetAttribute("BossWeakPointEndsAt"))
+        local dizzy=boss:GetAttribute("BossWeakPointDizzy")==true
+            and boss:GetAttribute("BossVulnerable")==true
+        local exposed=type(name)=="string"and name~=""and(not ends or now<ends or dizzy)
+        if dizzy and not exposed then name=config.WeakPoint.DizzySpot or "Head";exposed=true end
+        local weak=options.WeakPoints()and exposed
+        if not weak and not options.BodyHits()then status("Waiting for exposed weak point");return end
+        local targetName=weak and name or "Chest"
+        local target,detail=resolve(body,targetName,head.Position)
+        if not target and not weak then targetName="Belly";target,detail=resolve(body,targetName,head.Position)end
+        if not target then status(detail);return end
+        aim=target
+        local vector=target-head.Position
+        local range=math.clamp(tonumber(options.Player:GetAttribute("PitchforkReach"))or(tonumber(config.PitchforkRange)or 13),
+            tonumber(config.PitchforkRange)or 13,24)
+        if options.Player:GetAttribute("PitchforkOwned")~=true then status("Waiting for pitchfork ownership");return end
+        if vector.Magnitude>range then status(string.format("Move closer to %s (%.1f / %.1f studs)",targetName,vector.Magnitude,range));return end
+        if vector.Magnitude<0.01 or now<nextSend then return end
+        local remote=options.Remote()
+        if not remote or not remote:IsA("RemoteEvent")then status("Waiting for PitchforkDig remote");return end
+        nextSend=now+math.max(0.1,tonumber(options.Player:GetAttribute("PitchforkCooldown"))or tonumber(config.PitchforkCooldown)or 0.85)
+        local ok,err=pcall(remote.FireServer,remote,"Boss",head.Position,vector.Unit)
+        if ok then stats.Requests+=1 end
+        status(ok and((weak and(dizzy and "Dizzy weak point: "or "Weak point: ")or "Body hit: ")..targetName.."; awaiting server feedback")
+            or("Pitchfork request failed: "..tostring(err)))
+    end
+    return api
+end
+
+
 local function createVacuumUpgradePriority(state, getConfig, getCash, getLevel, send)
     local pending
     local lastConfirmedAt
@@ -1961,6 +2098,8 @@ end
         Callback = function() pcall(_G.__BEYY_HUB_CLEANUP) end,
     })
 
+    local farmerBoss
+    local function farmerBossEngaged()return farmerBoss and farmerBoss.IsEngaged()or false end
     local tabletController,sundialController,potionController
     local sharedFarmPuzzleBusy = function()
         return(tabletController and tabletController.IsBusy())or(sundialController and sundialController.IsBusy())or(potionController and potionController.IsBusy())or false
@@ -1972,6 +2111,8 @@ end
         TntLightCooldown=0, TntThrowDelay=0.4,
         AutoUseVacuum=false, VacuumHotbarSlot=5, ToolInterval=0.5,
         AutoPickupTablets=false, AutoSolveSundial=false, AutoBringPotion=false,
+        Chapter5AutoBossFight=false, Chapter5BossWeakPoints=true, Chapter5BossBodyHits=true,
+        Chapter5BossVacuum=false, Chapter5BossAimVacuum=true,
         AutoBuyTools=false, BuyToolsList={"Pitchfork"}, BuyInterval=1,
         UpgBagSize=false, UpgExtraTake=false, UpgGemValue=false, UpgHayValue=false, PermInterval=0.5,
         UpgCapacity=false, UpgHandSpeed=false, UpgHandGrab=false, UpgHandHold=false,
@@ -2138,6 +2279,18 @@ end
     upgradesTab:Section({ Title="Capacity (Cash)" })
     farmToggle(upgradesTab,"UpgCapacity","Auto Upgrade Carry Capacity")
 
+    local bossTab=hubWindow:Tab({Title="Chapter 5 Boss",Icon="swords"})
+    farmToggle(bossTab,"Chapter5AutoBossFight","Auto Boss Fight",
+        "Attack the Farmer using cooldown-paced pitchfork requests. Move within weapon range; starts OFF.")
+    farmToggle(bossTab,"Chapter5BossWeakPoints","Target Boss Weak Points",
+        "Follow exposed weak points on the animated Farmer, including the dizzy/downed head window.")
+    farmToggle(bossTab,"Chapter5BossBodyHits","Hit Body Between Weak Points",
+        "Attack the Farmer's chest or belly when no selected weak point is available.")
+    farmToggle(bossTab,"Chapter5BossVacuum","Use Vacuum During Boss",
+        "Use the existing heat-aware vacuum worker alongside pitchfork hits during Auto Boss Fight.")
+    farmToggle(bossTab,"Chapter5BossAimVacuum","Aim Vacuum at Boss",
+        "Keep the normal camera aimed at the current weak point or body target while boss vacuum is in range.")
+    local farmerBossStatus=bossTab:Paragraph({Title="Farmer Boss Combat Status",Desc="Auto Boss Fight is OFF"})
     local upgradeStatus=upgradesTab:Paragraph({Title="Auto Upgrade Status",Desc="Waiting for upgrade check"})
     local function spawnChapterWorker(fn)
         if BEYY_CHAPTER ~= "Lobby" then task.spawn(fn) end
@@ -2258,8 +2411,8 @@ end
             task.wait(math.max(0.2,tonumber(sharedFarmState.ToolInterval) or 0.5))
             if (sharedFarmState.AutoUsePitchfork or sharedFarmState.AutoDeployDrone or sharedFarmState.AutoUseTNT)
                 and needleFolder and not farmBlocked() and not needlePriority() then
-                if sharedFarmState.AutoUsePitchfork and LocalPlayer:GetAttribute("PitchforkOwned")==true then
-                    local _,id=selectPitchforkHay(function() return not hubUnloaded and sharedFarmState.AutoUsePitchfork and not farmBlocked() and not needlePriority() end)
+                if sharedFarmState.AutoUsePitchfork and not farmerBossEngaged()and LocalPlayer:GetAttribute("PitchforkOwned")==true then
+                    local _,id=selectPitchforkHay(function() return not hubUnloaded and sharedFarmState.AutoUsePitchfork and not farmerBossEngaged()and not farmBlocked() and not needlePriority() end)
                     if id then sendFarmRemote("PitchforkDig",id) end
                 end
                 if sharedFarmState.AutoDeployDrone and LocalPlayer:GetAttribute("DroneOwned")==true
@@ -2331,7 +2484,9 @@ end
             Enum.KeyCode.Seven,Enum.KeyCode.Eight,Enum.KeyCode.Nine}
         while not hubUnloaded do
             task.wait(0.08)
-            local active=vacuumFocus.Ready() and needleFolder and BEYY_CHAPTER~="Lobby" and sharedFarmState.AutoUseVacuum
+            local bossVacuum=farmerBossEngaged()and farmerBoss.CanVacuum()
+            local vacuumWanted=bossVacuum or(not farmerBossEngaged()and sharedFarmState.AutoUseVacuum)
+            local active=vacuumFocus.Ready() and needleFolder and BEYY_CHAPTER~="Lobby" and vacuumWanted
                 and not farmBlocked() and not needlePriority() and hubWindow.Closed==true
             if not active then
                 releaseSharedVacuum()
@@ -2370,7 +2525,7 @@ end
                             task.wait(0.05)
                             pcall(function() VirtualInputManager:SendKeyEvent(false,Enum.KeyCode.One,false,game) end)
                             task.wait(0.15)
-                            if hubUnloaded or not sharedFarmState.AutoUseVacuum or farmBlocked() or not hubWindow.Closed or needlePriority() then continue end
+                            if hubUnloaded or not (farmerBossEngaged()and farmerBoss.CanVacuum()or not farmerBossEngaged()and sharedFarmState.AutoUseVacuum)or farmBlocked()or not hubWindow.Closed or needlePriority()then continue end
                             forceVacuumReselect=false
                         end
                         local equipped=false
@@ -2392,7 +2547,7 @@ end
                             vacuumPoint=point
                             pcall(function() VirtualInputManager:SendMouseButtonEvent(point.X,point.Y,0,false,game,0) end)
                             task.wait(0.05)
-                            if vacuumFocus.Ready() and focusGeneration==vacuumFocus.Generation() and sharedFarmState.AutoUseVacuum
+                            if vacuumFocus.Ready()and focusGeneration==vacuumFocus.Generation()and(farmerBossEngaged()and farmerBoss.CanVacuum()or not farmerBossEngaged()and sharedFarmState.AutoUseVacuum)
                                 and not farmBlocked() and hubWindow.Closed and not needlePriority() then
                             local pressed=pcall(function()
                                 VirtualInputManager:SendMouseButtonEvent(point.X,point.Y,0,true,game,0)
@@ -2416,6 +2571,53 @@ end
         end
         releaseSharedVacuum()
     end)
+    do
+        local cachedConfigModule,cachedConfig,nextConfigRead=nil,nil,0
+        farmerBoss=createFarmerBossCombat({
+            Player=LocalPlayer,World=Workspace,
+            Enabled=function()return not hubUnloaded and sharedFarmState.Chapter5AutoBossFight==true end,
+            WeakPoints=function()return sharedFarmState.Chapter5BossWeakPoints==true end,
+            BodyHits=function()return sharedFarmState.Chapter5BossBodyHits==true end,
+            VacuumEnabled=function()return sharedFarmState.Chapter5BossVacuum==true or sharedFarmState.AutoUseVacuum==true end,
+            AimVacuum=function()return sharedFarmState.Chapter5BossAimVacuum==true end,
+            Blocked=function()return hubUnloaded or not hubWindow.Closed or farmBlocked()or needlePriority()end,
+            Remote=function()return farmRemote("PitchforkDig")end,
+            Feedback=function()
+                local folder=ReplicatedStorage:FindFirstChild("FarmerBoss")
+                return folder and folder:FindFirstChild("Feedback")
+            end,
+            Config=function()
+                local folder=ReplicatedStorage:FindFirstChild("FarmerBoss")
+                local module=folder and folder:FindFirstChild("Config")
+                if module~=cachedConfigModule then cachedConfigModule=module;cachedConfig=nil;nextConfigRead=0 end
+                if not cachedConfig and module and os.clock()>=nextConfigRead then
+                    nextConfigRead=os.clock()+2
+                    local ok,value=pcall(require,module)
+                    if ok and type(value)=="table"then cachedConfig=value end
+                end
+                return cachedConfig
+            end,
+            Status=function(text)if not hubUnloaded then farmerBossStatus:SetDesc(text)end end,
+        })
+        local aimName="BeyyCh5BossAim_"..tostring(os.clock())
+        RunService:BindToRenderStep(aimName,Enum.RenderPriority.Camera.Value+20,function()
+            if not hubUnloaded then pcall(farmerBoss.Aim)end
+        end)
+        local previous=_G.__BEYY_HUB_CLEANUP
+        _G.__BEYY_HUB_CLEANUP=function()
+            farmerBoss.Stop()
+            pcall(function()RunService:UnbindFromRenderStep(aimName)end)
+            releaseSharedVacuum()
+            if previous then pcall(previous)end
+        end
+        spawnChapterWorker(function()
+            while not hubUnloaded do
+                local ok,err=pcall(farmerBoss.Tick)
+                if not ok and not hubUnloaded then farmerBossStatus:SetDesc("Farmer boss worker error: "..tostring(err))end
+                task.wait(sharedFarmState.Chapter5AutoBossFight and 0.05 or 0.5)
+            end
+        end)
+    end
     do
         local interactionOptions={
             World=Workspace,Now=os.clock,Wait=task.wait,
