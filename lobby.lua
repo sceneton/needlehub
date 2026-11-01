@@ -11,12 +11,14 @@ end
 do
     task.spawn(function()
         -- Collector v6: saves weekly players and your clan's member wins once per execution.
-        -- Saves locally; no HTTP, game remotes, or character movement.
+        -- Saves locally and uses the existing optional cloud upload configuration.
         if game.PlaceId ~= 77108422251420 then return end
         local H = game:GetService("HttpService")
         local player = game:GetService("Players").LocalPlayer
         assert(player and type(writefile) == "function", "Requires a player client with writefile")
         local env = type(getgenv) == "function" and getgenv() or _G
+        local previousCollector=env.NeedleWeeklyCollector
+        if type(previousCollector)=="table"and type(previousCollector.Stop)=="function"then pcall(previousCollector.Stop)end
         local run = {}
         env.NeedleWeeklyCollector = run
         local firstCapture = {startedAt = os.clock(), ready = false}
@@ -58,12 +60,42 @@ do
 
         -- Retry the previous saved capture before this execution makes a new one.
         task.spawn(uploadSavedCapture)
+        local surfaceRoot,surfaces=nil,{}
+        local surfaceConnections={}
+        local function clearSurfaceIndex()
+            for _,c in ipairs(surfaceConnections)do c:Disconnect()end
+            table.clear(surfaceConnections);table.clear(surfaces);surfaceRoot=nil
+        end
+        local function surfaceIndex(gui)
+            if gui~=surfaceRoot then
+                clearSurfaceIndex();surfaceRoot=gui
+                local function add(obj)if obj:IsA("SurfaceGui")then surfaces[obj]=true end end
+                surfaceConnections[1]=gui.DescendantAdded:Connect(add)
+                surfaceConnections[2]=gui.DescendantRemoving:Connect(function(obj)surfaces[obj]=nil end)
+                for _,obj in ipairs(gui:GetDescendants())do add(obj)end
+            end
+            return surfaces
+        end
+        local diagnosticSignature,lastDiagnosticAt,pendingDiagnostic=nil,-math.huge,nil
+        local function flushDiagnostic(force)
+            local pending=pendingDiagnostic
+            if not pending then return end
+            local parts={pending.reason,tostring(#pending.rawRows)}
+            for _,row in ipairs(pending.rawRows)do
+                parts[#parts+1]=table.concat({row.frame or"",row.rankText or"",row.usernameText or"",row.winsText or""},"|")
+            end
+            local signature=table.concat(parts,";")
+            if signature==diagnosticSignature or(not force and os.clock()-lastDiagnosticAt<10)then return end
+            if save("needle-weekly-diagnostics.json",pending)then
+                diagnosticSignature=signature;lastDiagnosticAt=os.clock()
+            end
+        end
         local function winsGui()
             local boards = workspace:FindFirstChild("Leaderboards")
             local board = boards and boards:FindFirstChild("TotalWinsLeaderboard")
             local display = board and board:FindFirstChild("DisplayPart")
             local gui
-            for _, obj in ipairs(player:WaitForChild("PlayerGui"):GetDescendants()) do
+            for obj in pairs(surfaceIndex(player:WaitForChild("PlayerGui"))) do
                 if display and obj:IsA("SurfaceGui") and obj.Adornee == display then
                     assert(not gui, "Multiple wins displays; waiting")
                     gui = obj
@@ -117,11 +149,12 @@ do
             end
             local rows, users, duplicates = {}, {}, 0
             local function fail(reason)
-                save("needle-weekly-diagnostics.json", {
-                    collectorVersion = 6, observedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-                    period = period, reason = reason, rawRows = rawRows,
-                })
-                error(reason .. "; details saved in needle-weekly-diagnostics.json", 0)
+                pendingDiagnostic={
+                    collectorVersion=6,observedAt=os.date("!%Y-%m-%dT%H:%M:%SZ"),
+                    period=period,reason=reason,rawRows=rawRows,
+                }
+                flushDiagnostic(false)
+                error(reason .. "; diagnostics queued in needle-weekly-diagnostics.json",0)
             end
             for _, raw in ipairs(rawRows) do
                 local rank = tonumber(raw.rankText:match("^%s*#(%d+)%s*$"))
@@ -258,9 +291,21 @@ do
             warn("[Needle tracker v6] Clan members unavailable: " .. lastError)
             return {status = "unavailable", scope = "CLAN_MEMBERS", rows = {}}
         end
+        local teleportConnection
+        run.Stop=function()
+            clearSurfaceIndex()
+            if teleportConnection then teleportConnection:Disconnect();teleportConnection=nil end
+            if env.NeedleWeeklyCollector==run then env.NeedleWeeklyCollector=nil end
+        end
+        teleportConnection=player.OnTeleport:Connect(function(state)
+            if state==Enum.TeleportState.Started then
+                run.Stop();if teleportConnection then teleportConnection:Disconnect();teleportConnection=nil end
+            end
+        end)
         print("[Needle tracker v6] Waiting for one weekly-player and clan-member capture.")
         task.spawn(function()
             local deadline = os.clock() + 60
+            local failures,lastWarning,lastWarningAt=0,nil,-math.huge
             while env.NeedleWeeklyCollector == run and os.clock() < deadline do
                 local ok, snapshot = pcall(function()
                     requestClanMembers()
@@ -282,15 +327,24 @@ do
                     task.spawn(uploadSavedCapture)
                     firstCapture.ready = true
                     restoreClanTab()
+                    clearSurfaceIndex()
+                    if teleportConnection then teleportConnection:Disconnect();teleportConnection=nil end
                     print("[Needle tracker v6] Saved " .. #snapshot.rows .. " weekly players and "
                         .. #(snapshot.clans.rows or {}) .. " clan members once; capture=" .. snapshot.captureId .. ". Collector stopped.")
                     return
                 end
-                if not ok then warn("[Needle tracker v6] Waiting: " .. tostring(snapshot)) end
+                if not ok and(lastWarning~=tostring(snapshot)or os.clock()-lastWarningAt>=10)then
+                    lastWarning=tostring(snapshot);lastWarningAt=os.clock()
+                    warn("[Needle tracker v6] Waiting: "..lastWarning)
+                end
                 -- Retry initialization or an incomplete board only until the first successful save.
                 -- Never overwrite the last good input with a transient waiting/error packet.
-                task.wait(2)
+                failures+=1
+                task.wait(math.min(math.min(8,2^math.min(failures,3)),math.max(0,deadline-os.clock())))
             end
+            flushDiagnostic(true)
+            clearSurfaceIndex()
+            if teleportConnection then teleportConnection:Disconnect();teleportConnection=nil end
             if env.NeedleWeeklyCollector == run then
                 restoreClanTab()
                 warn("[Needle tracker v6] No stable capture within 60 seconds; rerun in the lobby.")
@@ -2964,3 +3018,4 @@ end
     print(("[BeyyHub Startup] %s controls and features registered after %.2fs in module"):format(
         BEYY_CHAPTER, os.clock() - __BEYY_BOOT_T0))
 end
+
