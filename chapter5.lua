@@ -433,6 +433,192 @@ local function installAntiIdle(tab, registry, isRunning)
 end
 
 -- Pitchfork-only targeting: maintain child slots and budget large searches.
+-- Opt-in local traces. Never issues gameplay requests or input.
+local function createChapter5Diagnostics(options)
+    local api={Entries={}}
+    local alive=true
+    local function serial(value,depth,seen,budget)
+        depth=depth or 0;seen=seen or{};budget=budget or{Left=1200}
+        budget.Left-=1;if budget.Left<0 then return "<size limit>"end
+        local kind=typeof(value)
+        if kind=="nil"or kind=="boolean"then return value end
+        if kind=="string"then return value:sub(1,1200)end
+        if kind=="number"then return value==value and math.abs(value)<math.huge and value or tostring(value)end
+        if kind=="Vector3"or kind=="Vector2"then return {X=value.X,Y=value.Y,Z=kind=="Vector3"and value.Z or nil}end
+        if kind=="CFrame"then return {Position=serial(value.Position),Components={value:GetComponents()}}end
+        if kind=="Instance"then
+            local ok,path=pcall(value.GetFullName,value)
+            return {Name=value.Name,Class=value.ClassName,Path=ok and path or nil}
+        end
+        if kind~="table"then return tostring(value)end
+        if depth>=10 or seen[value]then return "<depth/cycle limit>"end
+        seen[value]=true;local result,n={},0
+        for key,child in pairs(value)do
+            n+=1;if n>80 or budget.Left<=0 then result.__Truncated=true;break end
+            if type(key)=="number"or type(key)=="string"then result[key]=serial(child,depth+1,seen,budget)end
+        end
+        seen[value]=nil;return result
+    end
+    function api.Enabled(key)
+        local entry=api.Entries[key];return alive and options.Alive()and entry and entry.Enabled or false
+    end
+    function api.Add(key,title)
+        local entry={Key=key,Title=title,Enabled=false,Events={},Head=1,Count=0,Total=0,Dropped=0,
+            Counters={},Dirty=false,NextSave=0,Errors=0,Path=options.Folder.."/chapter5_"..key.."_diagnostics.json"}
+        api.Entries[key]=entry;return entry
+    end
+    function api.Record(key,kind,build)
+        if not api.Enabled(key)then return end
+        local entry=api.Entries[key]
+        local ok,data=pcall(function()return serial(type(build)=="function"and build()or build or{})end)
+        if not ok then entry.Errors+=1;entry.LastError=tostring(data);return end
+        entry.Total+=1;entry.Counters[kind]=(entry.Counters[kind]or 0)+1
+        local event={Sequence=entry.Total,At=options.Now(),Kind=kind,Data=data}
+        if entry.Count<256 then entry.Events[(entry.Head+entry.Count-1)%256+1]=event;entry.Count+=1
+        else entry.Events[entry.Head]=event;entry.Head=entry.Head%256+1;entry.Dropped+=1 end
+        entry.Dirty=true
+    end
+    function api.Snapshot(key)
+        local entry=api.Entries[key]
+        local ok,value=pcall(function()return serial({Common=options.Common(),Feature=entry.Probe and entry.Probe()or{}})end)
+        if ok then return value end
+        entry.Errors+=1;entry.LastError=tostring(value);return {SnapshotError=tostring(value)}
+    end
+    function api.Export(key,copy)
+        local entry=api.Entries[key];if not entry then return false,"Unknown diagnostic"end
+        local events={};for i=1,entry.Count do events[i]=entry.Events[(entry.Head+i-2)%256+1]end
+        local ok,json=pcall(options.Encode,{Schema=1,Module="Chapter5",Feature=entry.Title,PlaceId=options.PlaceId,
+            ExportedAt=options.Now(),Enabled=entry.Enabled,Capacity=256,TotalEvents=entry.Total,DroppedEvents=entry.Dropped,
+            DiagnosticErrors=entry.Errors,LastDiagnosticError=entry.LastError,Counters=entry.Counters,
+            Events=events,Current=api.Snapshot(key),
+            Interpretation="Client observations only. A sent request or mouse click is an attempt, not proof of a server-confirmed result."})
+        if not ok then entry.Errors+=1;entry.LastError=tostring(json);return false,entry.LastError end
+        local written,result=pcall(options.Write,entry.Path,json)
+        local saved=written and result~=false
+        if saved then entry.Dirty=false end
+        local copied=false
+        if copy and options.Copy then local copyOK,copyResult=pcall(options.Copy,json);copied=copyOK and copyResult~=false end
+        entry.LastExport={Saved=saved,Copied=copied,At=options.Now()}
+        if entry.Status then pcall(entry.Status,saved,copied)end
+        return saved,entry.Path,copied
+    end
+    function api.SetEnabled(key,enabled)
+        local entry=api.Entries[key];if not alive or not entry then return end
+        enabled=enabled==true;if enabled==entry.Enabled then return end
+        if not enabled then
+            api.Record(key,"RecordingStopped");entry.Enabled=false
+            if entry.OnEnabled then pcall(entry.OnEnabled,false)end
+            api.Export(key,false)
+        else
+            entry.Enabled=true;entry.LastSnapshot=nil;entry.NextSave=0
+            if entry.OnEnabled then pcall(entry.OnEnabled,true)end
+            api.Record(key,"RecordingStarted");api.Tick()
+        end
+    end
+    function api.Tick()
+        if not alive or not options.Alive()then return end
+        for key,entry in pairs(api.Entries)do
+            if entry.Enabled then
+                local snapshot=api.Snapshot(key)
+                local ok,signature=pcall(options.Encode,snapshot)
+                if ok and signature~=entry.LastSnapshot then
+                    entry.LastSnapshot=signature;api.Record(key,"StateChanged",snapshot)
+                end
+                if entry.Dirty and options.Now()>=entry.NextSave then entry.NextSave=options.Now()+5;api.Export(key,false)end
+            end
+        end
+    end
+    function api.Stop()
+        if not alive then return end
+        for key,entry in pairs(api.Entries)do if entry.Enabled then api.SetEnabled(key,false)end end
+        alive=false
+    end
+    return api
+end
+
+local function createChapter5DiagnosticProbes(options)
+    local world,player=options.World,options.Player
+    local api={}
+    local function attrs(obj)return obj and obj:GetAttributes()or{}end
+    local function root()
+        local char=player.Character;return char and char:FindFirstChild("HumanoidRootPart")
+    end
+    local function promptInfo(prompt)
+        if not prompt then return {Present=false}end
+        local parent=prompt.Parent
+        local pos=parent and(parent:IsA("Attachment")and parent.WorldPosition or parent:IsA("BasePart")and parent.Position)
+        local r=root()
+        local distance=r and pos and(r.Position-pos).Magnitude
+        return {Present=true,Object=prompt,Enabled=prompt.Enabled,HoldDuration=prompt.HoldDuration,
+            MaxActivationDistance=prompt.MaxActivationDistance,RequiresLineOfSight=prompt.RequiresLineOfSight,
+            Position=pos,Distance=distance,WithinRange=distance and distance<=prompt.MaxActivationDistance or false}
+    end
+    api.tablets=function()
+        local folder=world:FindFirstChild("RelicTablets");local list={}
+        if folder then for i,obj in ipairs(folder:GetChildren())do
+            if i>12 then break end
+            list[#list+1]={Object=obj,Attributes=attrs(obj),Prompt=promptInfo(obj:FindFirstChildWhichIsA("ProximityPrompt",true))}
+        end end
+        return {FolderPresent=folder~=nil,Tablets=list,PromptFunctionAvailable=type(fireproximityprompt)=="function"}
+    end
+    api.sundial=function()
+        local obj=world:FindFirstChild("Sundial");local rings,cranks={},{}
+        local folder=obj and obj:FindFirstChild("Rings")
+        if folder then for i,ring in ipairs(folder:GetChildren())do
+            if i>12 then break end
+            local tiles={};for j,tile in ipairs(ring:GetChildren())do if j>32 then break end;tiles[#tiles+1]={Name=tile.Name,Attributes=attrs(tile)}end
+            rings[#rings+1]={Name=ring.Name,Attributes=attrs(ring),Tiles=tiles}
+        end end
+        folder=obj and obj:FindFirstChild("Pedestals")
+        if folder then for i,crank in ipairs(folder:GetChildren())do if i>12 then break end
+            cranks[#cranks+1]={Name=crank.Name,Attributes=attrs(crank),Prompt=promptInfo(crank:FindFirstChildWhichIsA("ProximityPrompt",true))}
+        end end
+        return {Present=obj~=nil,Attributes=attrs(obj),Rings=rings,Cranks=cranks}
+    end
+    api.potion=function()
+        local npcs=world:FindFirstChild("NPC");local farmer=npcs and npcs:FindFirstChild("Farmer_NPC")
+        local r=root();local position=farmer and farmer:GetPivot().Position
+        local scripts=player:FindFirstChild("PlayerScripts")
+        local shared=options.Shared()
+        return {FarmerPresent=farmer~=nil,FarmerPosition=position,FarmerDistance=r and position and(r.Position-position).Magnitude,
+            HandedInBy=shared and shared:GetAttribute("PotionHandedInBy"),CutsceneAt=shared and shared:GetAttribute("PotionCutsceneAt"),
+            PotionOwned=player:GetAttribute("NeedleOwned"),HotbarModulePresent=scripts and scripts:FindFirstChild("HotbarSlots")~=nil,
+            SundialSolved=world:FindFirstChild("Sundial")and world.Sundial:GetAttribute("Solved")}
+    end
+    api.camera=function()
+        local cam=world.CurrentCamera
+        return {Camera=cam,Pose=cam and cam.CFrame,Focus=cam and cam.Focus,Subject=cam and cam.CameraSubject,
+            Type=cam and tostring(cam.CameraType),MouseBehavior=tostring(options.Input.MouseBehavior)}
+    end
+    api.boss=function()
+        local boss=world:FindFirstChild("FarmerBoss");local r=root()
+        local bossRoot=boss and boss:FindFirstChild("RootPart");local shared=options.Storage:FindFirstChild("FarmerBoss")
+        return {Present=boss~=nil,Attributes=attrs(boss),Root=bossRoot,
+            RootDistance=r and bossRoot and bossRoot:IsA("BasePart")and(r.Position-bossRoot.Position).Magnitude,
+            ConfigModulePresent=shared and shared:FindFirstChild("Config")~=nil,FeedbackPresent=shared and shared:FindFirstChild("Feedback")~=nil,
+            PitchforkRemotePresent=options.Shared()and options.Shared():FindFirstChild("PitchforkDig")~=nil}
+    end
+    api.tools=function()
+        local result={};for key,value in pairs(player:GetAttributes())do
+            if key:find("Tnt",1,true)or key:find("Pitchfork",1,true)or key:find("Drone",1,true)or key:find("Vacuum",1,true)then result[key]=value end
+        end
+        return {Attributes=result}
+    end
+    api.collecting=function()
+        local list={};for _,name in ipairs({"HaystackClient","DroppedHay","GemsClient"})do local folder=world:FindFirstChild(name);list[name]={Present=folder~=nil}end
+        return {Folders=list,Held=player:GetAttribute("HayHeld"),Capacity=player:GetAttribute("HayCapacity")}
+    end
+    api.upgrades=function()
+        local result={};for key,value in pairs(player:GetAttributes())do
+            if key:find("Upgrade",1,true)or key=="Cash"or key=="Money"or key=="Gems"then result[key]=value end
+        end
+        local shared=options.Shared();local configs=shared and shared:FindFirstChild("Configs")
+        return {Attributes=result,ConfigFolderPresent=configs~=nil,TrackConfigPresent=shared and shared:FindFirstChild("Config")~=nil,
+            BuyUpgradeRemotePresent=shared and shared:FindFirstChild("BuyUpgrade")~=nil}
+    end
+    return api
+end
+
 local function createSharedFolderIndex()
     local api={}
     local alive=true
@@ -819,7 +1005,7 @@ end
 
 
 
-local function createTntRetryGate(getRemote, getCooldown, getLightCooldown, getThrowDelay)
+local function createTntRetryGate(getRemote, getCooldown, getLightCooldown, getThrowDelay, trace)
     local remote, connection
     local alive, nextLightAt, phase, expiresAt = true, 0, nil, 0
     local function cooldown()
@@ -835,6 +1021,7 @@ local function createTntRetryGate(getRemote, getCooldown, getLightCooldown, getT
             if connection then connection:Disconnect() end
             remote=current; phase=nil; nextLightAt=0
             connection=remote.OnClientEvent:Connect(function(action,value)
+                if trace then pcall(trace,"TntFeedback",{Action=action,Value=value})end
                 local now=os.clock()
                 if action=="denied" then
                     local remaining=tonumber(value)
@@ -860,6 +1047,7 @@ local function createTntRetryGate(getRemote, getCooldown, getLightCooldown, getT
         if not gate.Ready() then return false end
         phase="waiting"
         nextLightAt=os.clock()+cooldown()+0.05 -- Lost acknowledgements must not cause rapid retries.
+        if trace then pcall(trace,"TntLightAttempt",{NextLightAt=nextLightAt,Cooldown=cooldown()})end
         local ok=pcall(remote.FireServer,remote,"light")
         if not ok then phase=nil;nextLightAt=os.clock()+1;return false end
         local deadline=os.clock()+2
@@ -871,8 +1059,11 @@ local function createTntRetryGate(getRemote, getCooldown, getLightCooldown, getT
     function gate.Throw(...)
         if not alive or phase~="lit" or os.clock()>=expiresAt then return false end
         phase=nil -- Exactly one throw for a confirmed lighting request.
+        if trace then pcall(trace,"TntThrowAttempt",{ExpiresAt=expiresAt,Now=os.clock()})end
         return pcall(remote.FireServer,remote,"throw",...)
     end
+    function gate.Inspect()return {Alive=alive,Phase=phase,ExpiresAt=expiresAt,NextLightAt=nextLightAt,
+        Remaining=gate.Remaining(),Cooldown=cooldown(),Remote=remote}end
     function gate.Stop()
         alive=false;phase=nil
         if connection then connection:Disconnect();connection=nil end
@@ -892,8 +1083,9 @@ local function createTabletPickup(options)
     local home,tripCharacter,tripRoot
     local lastStatus
     local api={}
+    local function trace(kind,data)if options.Trace then pcall(options.Trace,kind,data)end end
     local function status(text)
-        if text~=lastStatus then lastStatus=text;options.Status(text)end
+        if text~=lastStatus then trace("Status",{Message=text});lastStatus=text;options.Status(text)end
     end
     local function allowed()
         if not alive or not options.Enabled()or options.Blocked()then return false end
@@ -920,6 +1112,7 @@ local function createTabletPickup(options)
     end
     local function move(pose)
         check()
+        trace("Move",{From=tripRoot.CFrame,To=pose,Home=home})
         tripRoot.CFrame=pose
         tripRoot.AssemblyLinearVelocity=Vector3.zero
         tripRoot.AssemblyAngularVelocity=Vector3.zero
@@ -990,7 +1183,9 @@ local function createTabletPickup(options)
             check()
             assert(available(target)==prompt,"Tablet availability changed")
             assert((root.Position-position(prompt)).Magnitude<=prompt.MaxActivationDistance,"Character moved outside pickup range")
+            trace("PromptAttempt",function()return {Target=target,Attributes=target:GetAttributes(),Prompt=prompt,Distance=(root.Position-position(prompt)).Magnitude,Hold=prompt.HoldDuration+0.05}end)
             options.Trigger(prompt,prompt.HoldDuration+0.05)
+            trace("PromptReturned",{Target=target})
             local untilAt=options.Now()+2
             repeat
                 check()
@@ -1011,19 +1206,21 @@ local function createTabletPickup(options)
         end
         busy=false
     end
+    function api.Inspect()return {Alive=alive,Busy=busy,Returning=home~=nil,Home=home,TripCharacterMatches=not tripCharacter or options.Character()==tripCharacter,Retries=(function()local rows={}for tablet,retry in pairs(retries)do rows[#rows+1]={Tablet=tablet,Count=retry.Count,After=retry.After}end return rows end)(),Status=lastStatus}end
     return api
 end
 
 
 local function createSundialAutomation(options)
     local api={}
+    local function trace(kind,data)if options.Trace then pcall(options.Trace,kind,data)end end
     local alive,busy=true,false
     local home,tripCharacter,tripRoot,startedAt
     local nextTurnAt,retryAt,alignedAt=0,0,nil
     local failures,requests=0,0
     local lastStatus
     local function status(text)
-        if text~=lastStatus then lastStatus=text;options.Status(text)end
+        if text~=lastStatus then trace("Status",{Message=text});lastStatus=text;options.Status(text)end
     end
     local function clearTrip()
         home=nil;tripCharacter=nil;tripRoot=nil;startedAt=nil;requests=0;alignedAt=nil
@@ -1046,6 +1243,7 @@ local function createSundialAutomation(options)
         return nil
     end
     local function move(pose)
+        trace("Move",{From=tripRoot.CFrame,To=pose,Home=home})
         check();tripRoot.CFrame=pose
         tripRoot.AssemblyLinearVelocity=Vector3.zero;tripRoot.AssemblyAngularVelocity=Vector3.zero
     end
@@ -1161,7 +1359,9 @@ local function createSundialAutomation(options)
             assert(prompt.Enabled and(root.Position-position(prompt)).Magnitude<=prompt.MaxActivationDistance,"Crank unavailable or outside range")
             local before=target.Ring:GetAttribute("Steps")
             requests+=1;nextTurnAt=options.Now()+0.55
+            trace("TurnAttempt",{Ring=target.Index,Want=target.Want,Before=before,Remaining=latest.Remaining,Distance=(root.Position-position(prompt)).Magnitude,Prompt=prompt,Hold=prompt.HoldDuration+0.05,Requests=requests})
             options.Trigger(prompt,prompt.HoldDuration+0.05)
+            trace("TurnReturned",{Ring=target.Index,Before=before,After=target.Ring:GetAttribute("Steps"),Solved=sundial:GetAttribute("Solved")})
             local untilAt=options.Now()+2
             repeat
                 check()
@@ -1177,6 +1377,7 @@ local function createSundialAutomation(options)
         end
         busy=false
     end
+    function api.Inspect()return {Alive=alive,Busy=busy,Home=home,StartedAt=startedAt,Requests=requests,NextTurnAt=nextTurnAt,RetryAt=retryAt,AlignedAt=alignedAt,Failures=failures,Status=lastStatus}end
     return api
 end
 
@@ -1312,6 +1513,7 @@ local function createFarmerCameraLock(options)
     end
     function api.Stop(gameOwnsCamera)
         if not active then return end
+        if options.Trace then pcall(options.Trace,"CameraReleased",{GameOwnsCamera=gameOwnsCamera,Handoff=handoff(),Camera=camera,View=lastView})end
         active=false
         if not gameOwnsCamera and not handoff()and options.World.CurrentCamera==camera
             and camera.CameraType==Enum.CameraType.Scriptable and camera.CFrame==lastView then
@@ -1349,6 +1551,7 @@ local function createFarmerCameraLock(options)
         local currentCamera=options.World.CurrentCamera
         if not currentCamera then return end
         active=true;farmer=target;root=currentRoot;camera=currentCamera;savedType=camera.CameraType
+        if options.Trace then pcall(options.Trace,"CameraLocked",{Farmer=farmer,Root=root,Camera=camera,SavedType=tostring(savedType)})end
         api.Step()
     end
     return api
@@ -1419,6 +1622,7 @@ local function createFarmerClick(options)
             params.FilterDescendantsInstances={options.Player.Character,camera}
             local hit=options.World:Raycast(ray.Origin,ray.Direction*500,params)
             assert(hit and hit.Instance:IsDescendantOf(farmer),"Farmer aim changed before click")
+            if options.Trace then pcall(options.Trace,"AimVerified",{Screen={X=x,Y=y},RayOrigin=ray.Origin,RayDirection=ray.Direction,Hit=hit.Instance,Persistent=persistent})end
             pressed=true
             options.Input:SendMouseButtonEvent(x,y,0,true,game,0)
             options.Wait(0.08)
@@ -1432,6 +1636,7 @@ local function createFarmerClick(options)
             and camera.CFrame==aimed and not handoff()then
             camera.CFrame=savedView;camera.CameraType=savedType
         end
+        if options.Trace then pcall(options.Trace,"ClickCompleted",{Pressed=pressed,OK=ok,Error=not ok and tostring(err)or nil,Handoff=handoff()})end
         assert(ok,tostring(err))
     end
 end
@@ -1439,13 +1644,14 @@ end
 
 local function createPotionHandIn(options)
     local api={}
+    local function trace(kind,data)if options.Trace then pcall(options.Trace,kind,data)end end
     local alive,busy=true,false
     local pending,character,tripRoot
     local stationed=false
     local attempts,retryAt=0,0
     local lastStatus
     local function status(text)
-        if text~=lastStatus then lastStatus=text;options.Status(text)end
+        if text~=lastStatus then trace("Status",{Message=text});lastStatus=text;options.Status(text)end
     end
     local function accepted()
         local folder=options.Shared()
@@ -1500,6 +1706,7 @@ local function createPotionHandIn(options)
             if not stationed or(root.Position-target).Magnitude>6.5 then
                 local pose=options.Approach(target,root,hum,farmer,6.5)
                 assert(pose,"No floor-supported position beside farmer")
+                trace("Move",{From=root.CFrame,To=pose,FarmerPosition=target})
                 check();root.CFrame=pose
                 root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero
                 stationed=true
@@ -1508,7 +1715,9 @@ local function createPotionHandIn(options)
             end
             check()
             if options.LockView then options.LockView(farmer,root)end
-            assert(options.Equip(),"Potion slot is not ready")
+            local equipped=options.Equip()
+            trace("Equip",{Ready=equipped})
+            assert(equipped,"Potion slot is not ready")
             pause(0.1)
             if accepted()then busy=false;stationed=false;unlock(true);return end
             check()
@@ -1516,6 +1725,7 @@ local function createPotionHandIn(options)
             assert(farmer.Parent==npcs and(root.Position-farmer:GetPivot().Position).Magnitude<=14,"Farmer moved outside hand-in range")
             attempts+=1
             pending={Until=options.Now()+2}
+            trace("ClickAttempt",{Attempt=attempts,Distance=(root.Position-farmer:GetPivot().Position).Magnitude,PendingUntil=pending.Until})
             options.Click(farmer,function()
                 return allowed()and not accepted()and options.Player:GetAttribute("NeedleOwned")==true
                     and farmer.Parent==npcs and(root.Position-farmer:GetPivot().Position).Magnitude<=14
@@ -1529,6 +1739,7 @@ local function createPotionHandIn(options)
             if alive then status("Potion hand-in paused: "..tostring(err))end
         end
     end
+    function api.Inspect()return {Alive=alive,Busy=busy,Stationed=stationed,Pending=pending,Attempts=attempts,RetryAt=retryAt,TripCharacterMatches=not character or options.Character()==character,Status=lastStatus}end
     return api
 end
 
@@ -1580,6 +1791,7 @@ end
 
 local function createFarmerBossCombat(options)
     local api={}
+    local function trace(kind,data)if options.Trace then pcall(options.Trace,kind,data)end end
     local alive,nextSend=true,0
     local currentBoss,currentRoot,feedback,feedbackConnection
     local bones={}
@@ -1602,6 +1814,7 @@ local function createFarmerBossCombat(options)
             feedbackConnection=remote.OnClientEvent:Connect(function(kind,userId,amount,position,tool,grade)
                 if not alive or not options.Enabled()or kind~="Hit"or userId~=options.Player.UserId
                     or type(amount)~="number"or amount<0 or(tool~="Pitchfork"and tool~="Vacuum")then return end
+                trace("ObservedHit",{UserId=userId,Amount=amount,Position=position,Tool=tool,Grade=grade})
                 stats.Hits+=1;stats.Damage+=amount
                 if grade=="Weak"or grade=="Break"or grade=="Critical"then stats.WeakHits+=1 end
                 status("Confirmed "..tool..": "..string.format("%.1f",amount).." damage ("..tostring(grade or "Normal")..")")
@@ -1706,11 +1919,14 @@ local function createFarmerBossCombat(options)
         local remote=options.Remote()
         if not remote or not remote:IsA("RemoteEvent")then status("Waiting for PitchforkDig remote");return end
         nextSend=now+math.max(0.1,tonumber(options.Player:GetAttribute("PitchforkCooldown"))or tonumber(config.PitchforkCooldown)or 0.85)
+        trace("HitRequest",{TargetKind=weak and "Weak"or "Body",Region=targetName,Dizzy=dizzy,Origin=head.Position,Target=target,Direction=vector.Unit,Distance=vector.Magnitude,Range=range,NextSendServerTime=nextSend})
         local ok,err=pcall(remote.FireServer,remote,"Boss",head.Position,vector.Unit)
+        trace("HitRequestResult",{TargetKind=weak and "Weak"or "Body",Sent=ok,Error=not ok and tostring(err)or nil})
         if ok then stats.Requests+=1 end
         status(ok and((weak and(dizzy and "Dizzy weak point: "or "Weak point: ")or "Body hit: ")..targetName.."; awaiting server feedback")
             or("Pitchfork request failed: "..tostring(err)))
     end
+    function api.Inspect()return {Alive=alive,Engaged=api.IsEngaged(),NextSendServerTime=nextSend,Target=aim,Stats=stats,Action=lastAction,PitchforkRange=config and config.PitchforkRange,VacuumRange=config and config.VacuumRange,WeakPointConfig=config and config.WeakPoint}end
     return api
 end
 
@@ -2438,6 +2654,92 @@ end
         if BEYY_CHAPTER ~= "Lobby" then task.spawn(fn) end
     end
     local needleFolder = ReplicatedStorage:FindFirstChild("NeedleHaystack")
+    local diagnosticProbes=createChapter5DiagnosticProbes({World=Workspace,Player=LocalPlayer,Storage=ReplicatedStorage,
+        Input=UserInputService,Shared=function()return ReplicatedStorage:FindFirstChild("NeedleHaystack")end})
+    local diagnostics=createChapter5Diagnostics({Alive=function()return not hubUnloaded end,Folder=CACHE_FOLDER,Now=os.clock,
+        PlaceId=game.PlaceId,Encode=function(value)return game:GetService("HttpService"):JSONEncode(value)end,
+        Write=function(path,json)return safeWrite(path,json)end,
+        Copy=type(setclipboard)=="function"and setclipboard or nil,
+        Common=function()
+            local char=LocalPlayer.Character;local r=char and char:FindFirstChild("HumanoidRootPart")
+            local hum=char and char:FindFirstChildOfClass("Humanoid")
+            local flags={}
+            for _,key in ipairs({"NeedleOwned","NeedleInputLocked","CutsceneActive","IntroCutsceneFinished","HintViewerOpen",
+                "NeedleRoundComplete","BossHeld","BossRagdolled","BossRagdollRecovering","BossKnockdownCamera","BossStunnedUntil"})do flags[key]=LocalPlayer:GetAttribute(key)end
+            return {MenuOpen=not hubWindow.Closed,Unloaded=hubUnloaded,Flags=flags,
+                CutsceneBypassEnabled=Registry.CutsceneBypass and Registry.CutsceneBypass.Value,Root=r and r.CFrame,
+                Velocity=r and r.AssemblyLinearVelocity,Anchored=r and r.Anchored,Health=hum and hum.Health,
+                WalkSpeed=hum and hum.WalkSpeed,JumpPower=hum and hum.JumpPower,PlatformStand=hum and hum.PlatformStand,
+                Sit=hum and hum.Sit,AutoRotate=hum and hum.AutoRotate,MoveDirection=hum and hum.MoveDirection,
+                ServerTime=Workspace:GetServerTimeNow(),TabletBusy=tabletController and tabletController.IsBusy()or false,
+                SundialBusy=sundialController and sundialController.IsBusy()or false,PotionBusy=potionController and potionController.IsBusy()or false}
+        end,
+    })
+    local function diagnosticTrace(key)return function(kind,data)diagnostics.Record(key,kind,data)end end
+    local diagnosticsTab=farmingSection:Tab({Title="Diagnostics",Icon="activity"})
+    diagnosticsTab:Paragraph({Title="Chapter 5 diagnostics",Desc="Turn on the area you want to investigate, close the menu, and reproduce the issue. Turn recording off to save the final log, or use Save / Copy. Files are local in BeyyHub. Logs retain the latest 256 events per area; automatic saves run at most once per 5 seconds."})
+    local diagnosticSpecs={
+        {"tablets","Tablet Pickup",{"AutoPickupTablets"},function()return tabletController end,"tablets"},
+        {"sundial","Sundial",{"AutoSolveSundial"},function()return sundialController end,"sundial"},
+        {"potion","Potion Hand-in",{"AutoBringPotion"},function()return potionController end,"potion"},
+        {"camera","Potion Camera",{"AutoBringPotion"},nil,"camera"},
+        {"boss_weakpoints","Boss Weak Points",{"Chapter5AutoBossFight","Chapter5BossWeakPoints"},function()return farmerBoss end,"boss"},
+        {"boss_body","Boss Body Hits",{"Chapter5AutoBossFight","Chapter5BossBodyHits"},function()return farmerBoss end,"boss"},
+        {"vacuum","Vacuum / Boss Vacuum",{"AutoUseVacuum","Chapter5AutoBossFight","Chapter5BossVacuum","Chapter5BossAimVacuum","VacuumHotbarSlot"},nil,"tools"},
+        {"tools","TNT / Pitchfork / Drone",{"AutoUseTNT","AutoUsePitchfork","AutoDeployDrone","TntLightCooldown","TntThrowDelay","ToolInterval"},nil,"tools"},
+        {"collecting","Collecting / Selling",{"AutoPickHay","AutoCollectDroppedHay","AutoCollectGems","AutoSellHay","SellOnlyIfFull","SellThreshold","CollectInterval"},nil,"collecting"},
+        {"upgrades","Upgrades / Shop",{},nil,"upgrades"},
+        {"cutscene","Cutscene Bypass",{},nil,"camera"},
+        {"performance","Frame Performance / Hit Effects",{"Chapter5ReduceHitEffects"},nil,nil},
+    }
+    for _,spec in ipairs(diagnosticSpecs)do
+        local key,title=spec[1],spec[2]
+        local entry=diagnostics.Add(key,title)
+        entry.Probe=function()
+            local flags={};for _,flag in ipairs(spec[3])do flags[flag]=sharedFarmState[flag]end
+            if key=="upgrades"then for flag,value in pairs(sharedFarmState)do if flag:sub(1,3)=="Upg"or flag:sub(1,7)=="AutoBuy"then flags[flag]=value end end end
+            local controller=spec[4]and spec[4]()
+            return {Settings=flags,Status=entry.LastStatus,Runtime=controller and controller.Inspect and controller.Inspect(),
+                World=spec[5]and diagnosticProbes[spec[5]](),Detail=entry.Detail and entry.Detail()}
+        end
+        diagnosticsTab:Section({Title=title})
+        local paragraph=diagnosticsTab:Paragraph({Title="Log file",Desc=entry.Path.." | Recording is OFF"})
+        entry.Status=function(saved,copied)paragraph:SetDesc(entry.Path.." | "..(entry.Enabled and "Recording"or "Stopped")..
+            " | "..(saved and "Saved"or "File save failed")..(copied and " + copied"or "").." | "..entry.Total.." events")end
+        diagnosticsTab:Toggle({Title="Record "..title,Value=false,Callback=function(enabled)diagnostics.SetEnabled(key,enabled)end})
+        diagnosticsTab:Button({Title="Save / Copy "..title.." Diagnostics",Callback=function()diagnostics.Export(key,true)end})
+    end
+    do
+        local frames={Count=0,Total=0,Worst=0,Over50ms=0,Over100ms=0};local connection
+        diagnostics.Entries.performance.Detail=function()
+            return {Frames=frames.Count,AverageMs=frames.Count>0 and frames.Total/frames.Count*1000 or 0,
+                WorstMs=frames.Worst*1000,Over50ms=frames.Over50ms,Over100ms=frames.Over100ms,
+                LuaMemoryKB=gcinfo(),ExtraHitEffectsReduced=sharedFarmState.Chapter5ReduceHitEffects}
+        end
+        diagnostics.Entries.performance.OnEnabled=function(enabled)
+            if connection then connection:Disconnect();connection=nil end
+            if enabled then
+                frames={Count=0,Total=0,Worst=0,Over50ms=0,Over100ms=0}
+                connection=RunService.Heartbeat:Connect(function(dt)
+                    frames.Count+=1;frames.Total+=dt;frames.Worst=math.max(frames.Worst,dt)
+                    if dt>=0.05 then frames.Over50ms+=1 end
+                    if dt>=0.1 then frames.Over100ms+=1;diagnostics.Record("performance","FrameStall",{Milliseconds=dt*1000})end
+                end)
+            end
+        end
+    end
+    local previousDiagnosticCleanup=_G.__BEYY_HUB_CLEANUP
+    _G.__BEYY_HUB_CLEANUP=function()
+        diagnostics.Stop()
+        if previousDiagnosticCleanup then pcall(previousDiagnosticCleanup)end
+    end
+    spawnChapterWorker(function()
+        while not hubUnloaded do
+            diagnostics.Tick()
+            task.wait(1)
+        end
+    end)
+
     local sharedGameConfig, sharedUpgradeConfig
     if needleFolder then
         pcall(function() sharedGameConfig=require(needleFolder:WaitForChild("Config",2)) end)
@@ -2459,8 +2761,12 @@ end
     end
     local function sendFarmRemote(name,...)
         local remote=farmRemote(name)
-        if not remote then return false end
-        return pcall(remote.FireServer,remote,...)
+        local key=(name=="BuyUpgrade"or name=="BuyShopItem")and "upgrades"
+            or(name=="PickHay"or name=="PickDroppedHay"or name=="CollectGem"or name=="SellHay")and "collecting"or "tools"
+        if not remote then diagnostics.Record(key,"RemoteUnavailable",{Remote=name});return false end
+        local ok,result=pcall(remote.FireServer,remote,...)
+        if diagnostics.Enabled(key)then diagnostics.Record(key,"RemoteAttempt",{Remote=name,Arguments=table.pack(...),Sent=ok,Error=not ok and tostring(result)or nil})end
+        return ok,result
     end
     local function farmRoot()
         local character=LocalPlayer.Character
@@ -2547,7 +2853,8 @@ end
     local tntRetry=createTntRetryGate(function() return farmRemote("TntAction") end,
         function() return LocalPlayer:GetAttribute("TntCooldown") end,
         function() return sharedFarmState.TntLightCooldown end,
-        function() return sharedFarmState.TntThrowDelay end)
+        function() return sharedFarmState.TntThrowDelay end,diagnosticTrace("tools"))
+    diagnostics.Entries.tools.Detail=function()return {Tnt=tntRetry.Inspect()}end
     spawnChapterWorker(function()
         while not hubUnloaded do
             task.wait(math.max(0.2,tonumber(sharedFarmState.ToolInterval) or 0.5))
@@ -2590,6 +2897,7 @@ end
     local vacuumCooldown=0
     local vacuumCooling=false
     local function releaseSharedVacuum()
+        if vacuumHeld then diagnostics.Record("vacuum","MouseReleased")end
         vacuumWatchdog.Stop()
         if vacuumHeld then
             vacuumHeld=false
@@ -2614,6 +2922,9 @@ end
             end
         end
     end)
+    diagnostics.Entries.vacuum.Detail=function()return {Held=vacuumHeld,StartedAt=vacuumStart,CooldownUntil=vacuumCooldown,
+        Cooling=vacuumCooling,FocusReady=vacuumFocus.Ready(),ForceReselect=forceVacuumReselect,
+        BossEngaged=farmerBossEngaged(),BossCanVacuum=farmerBoss and farmerBoss.CanVacuum()or false}end
     local oldCleanup=_G.__BEYY_HUB_CLEANUP
     _G.__BEYY_HUB_CLEANUP=function()
         vacuumFocus.Stop()
@@ -2695,6 +3006,7 @@ end
                                 VirtualInputManager:SendMouseButtonEvent(point.X,point.Y,0,true,game,0)
                             end)
                             if pressed then
+                                diagnostics.Record("vacuum","MousePressed",{Point=point,Level=level,Slot=slot,Boss=bossVacuum})
                                 vacuumHeld=true; vacuumStart=os.clock()
                                 vacuumWatchdog.Start(level)
                                 if focusGeneration~=vacuumFocus.Generation() then releaseSharedVacuum() end
@@ -2729,6 +3041,11 @@ end
         local pendingBossStatus,nextBossStatus=nil,0
         local cachedConfigModule,cachedConfig,nextConfigRead=nil,nil,0
         farmerBoss=createFarmerBossCombat({
+            Trace=function(kind,data)
+                if not data or data.TargetKind~="Body"then diagnostics.Record("boss_weakpoints",kind,data)end
+                if not data or data.TargetKind~="Weak"then diagnostics.Record("boss_body",kind,data)end
+                if kind=="ObservedHit"and data.Tool=="Vacuum"then diagnostics.Record("vacuum",kind,data)end
+            end,
             Player=LocalPlayer,World=Workspace,
             Enabled=function()return not hubUnloaded and sharedFarmState.Chapter5AutoBossFight==true end,
             WeakPoints=function()return sharedFarmState.Chapter5BossWeakPoints==true end,
@@ -2752,7 +3069,9 @@ end
                 end
                 return cachedConfig
             end,
-            Status=function(text)pendingBossStatus=text end,
+            Status=function(text)
+                pendingBossStatus=text;diagnostics.Entries.boss_weakpoints.LastStatus=text;diagnostics.Entries.boss_body.LastStatus=text
+            end,
         })
         local aimName="BeyyCh5BossAim_"..tostring(os.clock())
         RunService:BindToRenderStep(aimName,Enum.RenderPriority.Camera.Value+20,function()
@@ -2768,18 +3087,20 @@ end
         end
         spawnChapterWorker(function()
             while not hubUnloaded do
-                pcall(hitEffects.Tick)
+                local effectsOK,effectsError=pcall(hitEffects.Tick)
+                if not effectsOK then diagnostics.Record("performance","HitEffectsError",{Error=tostring(effectsError)})end
                 local ok,err=pcall(farmerBoss.Tick)
                 if pendingBossStatus and os.clock()>=nextBossStatus and not hubUnloaded then
                     farmerBossStatus:SetDesc(pendingBossStatus);pendingBossStatus=nil;nextBossStatus=os.clock()+0.25
                 end
-                if not ok and not hubUnloaded then farmerBossStatus:SetDesc("Farmer boss worker error: "..tostring(err))end
+                if not ok and not hubUnloaded then diagnostics.Record("boss_weakpoints","WorkerError",{Error=tostring(err)});diagnostics.Record("boss_body","WorkerError",{Error=tostring(err)});farmerBossStatus:SetDesc("Farmer boss worker error: "..tostring(err))end
                 task.wait(sharedFarmState.Chapter5AutoBossFight and 0.05 or 0.5)
             end
         end)
     end
     do
         local interactionOptions={
+            Trace=diagnosticTrace("tablets"),
             World=Workspace,Now=os.clock,Wait=task.wait,
             Character=function()
                 local char=LocalPlayer.Character
@@ -2823,11 +3144,13 @@ end
         }
         tabletController=createTabletPickup(interactionOptions)
         local sundialOptions=table.clone(interactionOptions)
+        sundialOptions.Trace=diagnosticTrace("sundial")
         sundialOptions.Enabled=function()return sharedFarmState.AutoSolveSundial==true end
         sundialOptions.Status=function(text)if not hubUnloaded then sundialStatus:SetDesc(text)end end
         sundialController=createSundialAutomation(sundialOptions)
         local potionOptions=table.clone(interactionOptions)
         potionOptions.Player=LocalPlayer
+        potionOptions.Trace=diagnosticTrace("potion")
         -- User-captured hand-in pose, Chapter 5, 1 November 2026.
         local savedFarmerPose=CFrame.new(-249.708892822,5.14999771118,24.4543495178,-0.0276857335120,4.19544843311e-10,0.999616682529,3.79587810073e-8,1.00000000000,6.31613927826e-10,-0.999616682529,3.79617155488e-8,-0.0276857335120)
         local savedFarmerCamera=CFrame.new(-249.227172852,6.83330154419,24.4410076141,-0.0276869274676,-0.266504645348,0.963435947895,0.00000000000,0.963805377483,0.266606867313,-0.999616622925,0.00738152489066,-0.0266848113388)
@@ -2837,6 +3160,7 @@ end
         local function clearFarmerView(view,farmer)
             farmerViewParams.FilterDescendantsInstances={LocalPlayer.Character,Workspace.CurrentCamera}
             local hit=Workspace:Raycast(view.Position,view.LookVector*500,farmerViewParams)
+            if diagnostics.Enabled("camera")then diagnostics.Record("camera","VisibilityRay",{Pose=view,Hit=hit and hit.Instance,FarmerVisible=hit and hit.Instance:IsDescendantOf(farmer)or false})end
             return hit and hit.Instance:IsDescendantOf(farmer)
         end
         local fallbackFarmerApproach=createFarmerApproach({World=Workspace,Player=LocalPlayer})
@@ -2855,6 +3179,7 @@ end
         end
         local cachedFarmerView={Until=0}
         local farmerView=createFarmerCameraLock({
+            Trace=diagnosticTrace("camera"),
             World=Workspace,Player=LocalPlayer,
             ViewPose=function(root,farmer)
                 local view=root.CFrame*savedCameraOffset
@@ -2874,14 +3199,17 @@ end
             Shared=function()return ReplicatedStorage:FindFirstChild("NeedleHaystack")end,
             Enabled=function()return not hubUnloaded and sharedFarmState.AutoBringPotion==true and hubWindow.Closed==true end,
         })
+        diagnostics.Entries.camera.Detail=function()return {PotionLockActive=farmerView.IsLocked(),SavedFarmerPose=savedFarmerPose,
+            SavedFarmerCamera=savedFarmerCamera,CachedFarmerView=cachedFarmerView}end
         local farmerViewId="BeyyCh5PotionView_"..tostring(os.clock())
         RunService:BindToRenderStep(farmerViewId,Enum.RenderPriority.Camera.Value+10,function()
-            local ok=pcall(farmerView.Step)
-            if not ok then farmerView.Stop(false)end
+            local ok,err=pcall(farmerView.Step)
+            if not ok then diagnostics.Record("camera","RenderError",{Error=tostring(err)});farmerView.Stop(false)end
         end)
         potionOptions.LockView=farmerView.Start
         potionOptions.UnlockView=farmerView.Stop
         potionOptions.Click=createFarmerClick({
+            Trace=diagnosticTrace("potion"),
             ViewLocked=farmerView.IsLocked,
             World=Workspace,Player=LocalPlayer,Input=VirtualInputManager,Wait=task.wait,
             FrameWait=function()RunService.RenderStepped:Wait()end,
@@ -2920,15 +3248,15 @@ end
             while not hubUnloaded do
                 if not sundialController.IsBusy()and not potionController.IsBusy()then
                     local ok,err=pcall(tabletController.Tick)
-                    if not ok and not hubUnloaded then tabletStatus:SetDesc("Tablet worker error: "..tostring(err))end
+                    if not ok and not hubUnloaded then diagnostics.Record("tablets","WorkerError",{Error=tostring(err)});tabletStatus:SetDesc("Tablet worker error: "..tostring(err))end
                 end
                 if not tabletController.IsBusy()and not potionController.IsBusy()then
                     local ok,err=pcall(sundialController.Tick)
-                    if not ok and not hubUnloaded then sundialStatus:SetDesc("Sundial worker error: "..tostring(err))end
+                    if not ok and not hubUnloaded then diagnostics.Record("sundial","WorkerError",{Error=tostring(err)});sundialStatus:SetDesc("Sundial worker error: "..tostring(err))end
                 end
                 if not tabletController.IsBusy()and not sundialController.IsBusy()then
                     local ok,err=pcall(potionController.Tick)
-                    if not ok and not hubUnloaded then potionStatus:SetDesc("Potion worker error: "..tostring(err))end
+                    if not ok and not hubUnloaded then diagnostics.Record("potion","WorkerError",{Error=tostring(err)});potionStatus:SetDesc("Potion worker error: "..tostring(err))end
                 end
                 task.wait((sundialController.IsBusy()or potionController.IsBusy())and 0.05
                     or(sharedFarmState.AutoPickupTablets or sharedFarmState.AutoSolveSundial or sharedFarmState.AutoBringPotion)and 0.25 or 0.5)
@@ -3021,12 +3349,16 @@ end
             State=sharedFarmState,Player=LocalPlayer,Cash=cash,
             Folder=function() needleFolder=ReplicatedStorage:FindFirstChild("NeedleHaystack");return needleFolder end,
             OnConfig=function(config) sharedGameConfig=config end,
-            Status=function(text) upgradeStatus:SetDesc(text) end,
+            Status=function(text) diagnostics.Entries.upgrades.LastStatus=text;diagnostics.Record("upgrades","Status",{Message=text});upgradeStatus:SetDesc(text) end,
+            OnRequested=function(pending)diagnostics.Record("upgrades","PurchaseRequested",pending)end,
             OnConfirmed=function(pending,current)
+                diagnostics.Record("upgrades","PurchaseConfirmed",{Purchase=pending,Level=current})
                 print(string.format("[BeyyHub Upgrade] Cash %s L%d->L%d confirmed after %.3fs",
                     pending.Name,pending.Level,current,os.clock()-pending.Started))
             end,
         })
+        diagnostics.Entries.upgrades.Detail=function()return {Cash=cash(),CashConfigLoaded=sharedGameConfig~=nil,
+            PermanentConfigLoaded=sharedUpgradeConfig~=nil}end
         spawnChapterWorker(function()
             local wake=createWorkerWake(LocalPlayer)
             while not hubUnloaded do
@@ -3106,8 +3438,12 @@ local function launchCutsceneBypass()
         local lastRenderTime = os.clock()
 
         local function log(s)
-            -- Keep the controller quiet during normal scene transitions.
+            diagnostics.Record("cutscene","Transition",{Message=s,Scene=scene,Active=active,Enabled=enabled})
         end
+        diagnostics.Entries.cutscene.Detail=function()return {Alive=alive,Enabled=enabled,Active=active,Scene=scene,
+            RecoveryEnd=recoveryEnd,IntroConfirmedAt=introConfirmedAt,IntroNeutralSeen=introNeutralSeen,
+            YieldingToEnding=yieldingToEnding,VisualMask=finalVisualsEnabled,HUDEnabled=hudEnabled,
+            MenuOrObjectiveYield=shouldYieldCutsceneBypass(),Yaw=yaw,Pitch=pitch,Distance=distance}end
         local function hook(c)
             if c then connections[#connections+1] = c end
         end
