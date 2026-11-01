@@ -5498,6 +5498,7 @@ end
 do
 (function()
     local HAND_IN_INTERVAL=0.375
+    local HAND_IN_RETRY_INTERVAL=0.1875
     -- Farmer-relative position verified by the controlled hand-in tests.
     local FARMER_APPROACH=Vector3.new(-1.327728271484375,-0.3000001907348633,-3.909820556640625)
     local nextRequest=0
@@ -5531,7 +5532,7 @@ do
             return
         end
         if t<settleUntil or t<nextRequest then return end
-        nextRequest=t+HAND_IN_INTERVAL
+        nextRequest=t+HAND_IN_RETRY_INTERVAL
         if not Unloaded and State.__NeedleController.Owns()
             and not serverConfirmed and LocalPlayer:GetAttribute("NeedleRoundComplete")~=true
             and LocalPlayer:GetAttribute("NeedleOwned")==true then
