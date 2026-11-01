@@ -1,4 +1,4 @@
--- Standalone needle pickup / hand-in latency recorder with teleport continuation.
+-- Standalone needle pickup / hand-in ping recorder with teleport continuation.
 local function createNeedleLatencyRecorder(options)
     local api={};local alive=true;local sequence=0;local ring={};local pending={};local cycles={};local cycle
     local counters={};local lastSnapshot;local cycleNumber=0
@@ -8,7 +8,8 @@ local function createNeedleLatencyRecorder(options)
         if not ok then return end
         sequence+=1;counters[kind]=(counters[kind]or 0)+1
         local event={SessionId=options.SessionId,Sequence=sequence,At=at or options.Now(),WallTimeMs=options.WallTimeMs(),
-            PlaceId=options.PlaceId,Kind=kind,Data=clean}
+            PlaceId=options.PlaceId,Kind=kind,Data=clean,
+            Context=options.Context and options.Serialize(options.Context()) or nil}
         ring[#ring+1]=event;if #ring>512 then table.remove(ring,1)end
         pending[#pending+1]=event
         -- Bound memory if disk writes stop working.
@@ -30,6 +31,8 @@ local function createNeedleLatencyRecorder(options)
         if times.OwnershipObserved and times.FirstHandInRequest then current.OwnershipToHandInRequestMs=(times.FirstHandInRequest-times.OwnershipObserved)*1000 end
         if times.FirstHandInRequest and times.OwnershipCleared then current.HandInRequestToOwnershipClearedMs=(times.OwnershipCleared-times.FirstHandInRequest)*1000 end
         if times.FirstHandInRequest and times.RoundCompleteObserved then current.HandInRequestToRoundCompleteMs=(times.RoundCompleteObserved-times.FirstHandInRequest)*1000 end
+        if times.FirstHandInRequest and times.ServerCompletionObserved then current.FirstHandInRequestToServerCompletionMs=(times.ServerCompletionObserved-times.FirstHandInRequest)*1000 end
+        if times.LastHandInRequest and times.ServerCompletionObserved then current.LastHandInRequestToServerCompletionMs=(times.ServerCompletionObserved-times.LastHandInRequest)*1000 end
         return current
     end
     function api.Exposed(target)
@@ -51,7 +54,11 @@ local function createNeedleLatencyRecorder(options)
         if not alive then return end
         local current
         if kind=="Pickup"then current=stamp("FirstPickupRequest",at);current.PickupRequests+=1
-        elseif kind=="HandIn"then current=stamp("FirstHandInRequest",at);current.HandInRequests+=1
+        elseif kind=="HandIn"then
+            current=stamp("FirstHandInRequest",at)
+            local requestAt=at or options.Now()
+            current.LastHandInRequestIntervalMs=current.Times.LastHandInRequest and(requestAt-current.Times.LastHandInRequest)*1000 or nil
+            current.Times.LastHandInRequest=requestAt;current.HandInRequests+=1
         elseif kind=="MousePress"then current=cycle;if current then current.MousePressAttempts+=1 end end
         api.Record(kind.."Attempt",{Details=data,Timings=current},at)
     end
@@ -59,6 +66,11 @@ local function createNeedleLatencyRecorder(options)
         if not alive then return end
         if cycle then stamp("RoundCompleteObserved")end
         api.Record("RoundCompleteObserved",{Timings=cycle})
+    end
+    function api.ServerComplete(data)
+        if not alive then return end
+        if cycle then stamp("ServerCompletionObserved")end
+        api.Record("ServerCompletionObserved",{Details=data,Timings=cycle})
     end
     function api.Sample(snapshot,force)
         if not alive then return end
@@ -78,14 +90,70 @@ local function createNeedleLatencyRecorder(options)
     return api
 end
 
+local function createNeedlePingTelemetry(options)
+    local api={};local ping={};local frames={};local movement={};local previous
+    local lastPing=-math.huge;local frameAt=options.Now();local frameCount,frameSum,frameMax=0,0,0
+    function api.PollPing(force)
+        local t=options.Now()
+        if not force and t-lastPing<1 then return end
+        lastPing=t
+        local ok,seconds=pcall(options.ReadNetworkPing)
+        local dataOK,dataMs=pcall(options.ReadDataPing)
+        ping={SampleAt=t,NetworkPingMs=ok and type(seconds)=="number"and seconds>=0 and seconds*1000 or nil,
+            DataPingMs=dataOK and type(dataMs)=="number"and dataMs>=0 and dataMs or nil,
+            NetworkPingSource="LocalPlayer:GetNetworkPing() seconds * 1000; documented round-trip network latency",
+            DataPingSource="Stats.Network.ServerStatsItem['Data Ping']:GetValue() milliseconds",
+            NetworkPingUnavailable=not ok or type(seconds)~="number",DataPingUnavailable=not dataOK or type(dataMs)~="number"}
+    end
+    function api.Frame(dt)
+        frameCount+=1;frameSum+=dt;frameMax=math.max(frameMax,dt)
+        local t=options.Now()
+        if t-frameAt>=1 then
+            frames={SampleAt=t,AverageFrameMs=frameCount>0 and frameSum/frameCount*1000 or nil,
+                MaxFrameMs=frameMax*1000,Frames=frameCount,WindowSeconds=t-frameAt}
+            frameAt=t;frameCount=0;frameSum=0;frameMax=0
+        end
+    end
+    function api.Movement(sample)
+        local t=options.Now();local emitted={}
+        if not sample then previous=nil;return emitted end
+        if previous and previous.Character==sample.Character then
+            local elapsed=t-previous.At
+            local dx,dy,dz=sample.X-previous.X,sample.Y-previous.Y,sample.Z-previous.Z
+            local distance=math.sqrt(dx*dx+dy*dy+dz*dz)
+            if distance>=8 and elapsed>0 and elapsed<=0.25 then
+                movement.LastJumpAt=t
+                emitted[#emitted+1]={Kind="MovementJumpObserved",Data={Distance=distance,SampleGapMs=elapsed*1000,
+                    From={X=previous.X,Y=previous.Y,Z=previous.Z},To={X=sample.X,Y=sample.Y,Z=sample.Z},
+                    FarmerDistance=sample.FarmerDistance,Meaning="Observed client movement jump; not proof of server position or a specific teleport caller"}}
+            end
+            if sample.FarmerDistance and previous.FarmerDistance and sample.FarmerDistance<=14 and previous.FarmerDistance>14 then
+                movement.LastFarmerRangeEntryAt=t
+                emitted[#emitted+1]={Kind="FarmerRangeEntered",Data={Distance=sample.FarmerDistance,SampleGapMs=elapsed*1000,
+                    Meaning="Client root entered the native client's 14-stud range; server acceptance is unknown"}}
+            end
+        elseif previous then movement={}end
+        previous={At=t,Character=sample.Character,X=sample.X,Y=sample.Y,Z=sample.Z,FarmerDistance=sample.FarmerDistance}
+        return emitted
+    end
+    function api.Context(at)
+        local t=at or options.Now()
+        return {Network=ping,Frames=frames,NetworkSampleAgeMs=ping.SampleAt and(t-ping.SampleAt)*1000,
+            SinceMovementJumpMs=movement.LastJumpAt and(t-movement.LastJumpAt)*1000,
+            SinceFarmerRangeEntryMs=movement.LastFarmerRangeEntryAt and(t-movement.LastFarmerRangeEntryAt)*1000,
+            TimingNote="Movement times are sampled client observations. Confirmation after multiple attempts cannot identify the accepted request."}
+    end
+    return api
+end
+
 -- Standalone observer: does not issue gameplay requests, clicks, teleports or attribute writes.
 local ROOT="BeyyHub"
-local RECORDER_VERSION="3"
+local RECORDER_VERSION="4-ping"
 local SOURCE_URL="https://raw.githubusercontent.com/sceneton/needlehub/main/needle-latency-diagnostics.lua"
 local CACHE_PATH=ROOT.."/needle_latency_recorder.lua"
 local ENABLED_PATH=ROOT.."/needle_latency_enabled.txt"
-local LOG_PATH=ROOT.."/needle_latency_events.jsonl"
-local SUMMARY_PATH=ROOT.."/needle_latency_latest.json"
+local LOG_PATH=ROOT.."/needle_ping_events.jsonl"
+local SUMMARY_PATH=ROOT.."/needle_ping_latest.json"
 local FLAG="BeyyNeedleLatencyEnabled_v1"
 local H=game:GetService("HttpService")
 local Players=game:GetService("Players")
@@ -142,11 +210,16 @@ local function serialize(value,depth,seen)
     seen[value]=nil;return output
 end
 local function now()return os.clock()-sessionStart end
+local Stats=game:GetService("Stats")
+local telemetry=createNeedlePingTelemetry({Now=now,
+    ReadNetworkPing=function()return player:GetNetworkPing()end,
+    ReadDataPing=function()return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()end})
+telemetry.PollPing(true)
 local function persistEnabled(value)
     pcall(writefile,ENABLED_PATH,value and "true"or"false")
     pcall(Teleport.SetTeleportSetting,Teleport,FLAG,value)
 end
-local recorder=createNeedleLatencyRecorder({SessionId=run.SessionId,PlaceId=game.PlaceId,Now=now,
+local recorder=createNeedleLatencyRecorder({SessionId=run.SessionId,PlaceId=game.PlaceId,Now=now,Context=telemetry.Context,
     WallTimeMs=function()return DateTime.now().UnixTimestampMillis end,Serialize=serialize,Encode=function(t)return H:JSONEncode(t)end,
     Write=function(batch,summary)
         local lines={};for _,event in ipairs(batch)do lines[#lines+1]=H:JSONEncode(event)end
@@ -154,7 +227,7 @@ local recorder=createNeedleLatencyRecorder({SessionId=run.SessionId,PlaceId=game
         summary.TeleportQueueInstalled=run.QueueInstalled;summary.HookStatus=run.Hooks
         writefile(SUMMARY_PATH,H:JSONEncode(summary))
         if bytes+#chunk>8*1024*1024 then
-            local previous=read(LOG_PATH);if previous then writefile(ROOT.."/needle_latency_events.previous.jsonl",previous)end
+            local previous=read(LOG_PATH);if previous then writefile(ROOT.."/needle_ping_events.previous.jsonl",previous)end
             writefile(LOG_PATH,"");bytes=0;fallbackHistory=fallbackHistory and""or nil
         end
         if #chunk>0 then
@@ -167,6 +240,18 @@ local recorder=createNeedleLatencyRecorder({SessionId=run.SessionId,PlaceId=game
 local function record(kind,data)recorder.Record(kind,data)end
 local function hook(c)connections[#connections+1]=c;return c end
 local function clear(list)for _,c in ipairs(list)do pcall(c.Disconnect,c)end;table.clear(list)end
+local lastMovementSample=-math.huge
+local function sampleMovement(force)
+    local t=now()
+    if not force and t-lastMovementSample<0.05 then return end
+    lastMovementSample=t
+    local char=player.Character;local root=char and char:FindFirstChild("HumanoidRootPart")
+    local npc=World:FindFirstChild("NPC");local farmer=npc and npc:FindFirstChild("Farmer_NPC")
+    local position=root and root.Position
+    local sample=position and {Character=char,X=position.X,Y=position.Y,Z=position.Z,
+        FarmerDistance=farmer and(position-farmer:GetPivot().Position).Magnitude}
+    for _,event in ipairs(telemetry.Movement(sample))do record(event.Kind,event.Data)end
+end
 local function currentNeedle()
     for part in pairs(needleParts)do
         local hidden=part:GetAttribute("HIDDEN_WITHIN")
@@ -259,7 +344,7 @@ local function snapshot(ray)
         WalkSpeed=hum and hum.WalkSpeed,PlatformStand=hum and hum.PlatformStand,CameraType=camera and tostring(camera.CameraType),
         Camera=camera and camera.CFrame,Needle=exposed,NeedleId=exposed and exposed:GetAttribute("HayId"),
         NeedleDistance=root and exposed and(root.Position-exposed.Position).Magnitude,
-        FarmerDistance=root and farmer and(root.Position-farmer:GetPivot().Position).Magnitude,Controllers=controllerState()}
+        FarmerDistance=root and farmer and(root.Position-farmer:GetPivot().Position).Magnitude,Controllers=controllerState(),Telemetry=telemetry.Context()}
     if ray and camera and exposed then
         local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude;params.FilterDescendantsInstances={char,camera}
         local hit=World:Raycast(camera.CFrame.Position,camera.CFrame.LookVector*100,params)
@@ -270,18 +355,26 @@ local function snapshot(ray)
     return state
 end
 local feedbackConnections={}
+local completionRemote
 local function refreshRemotes()
     local folder=Storage:FindFirstChild("NeedleHaystack")
     local pick=folder and folder:FindFirstChild("PickHay");local hand=folder and folder:FindFirstChild("NeedleHandIn")
-    if pick==pickRemote and hand==handInRemote then return end
-    clear(feedbackConnections);pickRemote=pick;handInRemote=hand
+    local complete=folder and folder:FindFirstChild("NeedleRoundCompleted")
+    if pick==pickRemote and hand==handInRemote and complete==completionRemote then return end
+    clear(feedbackConnections);pickRemote=pick;handInRemote=hand;completionRemote=complete
+    if complete and complete:IsA("RemoteEvent")then
+        feedbackConnections[#feedbackConnections+1]=complete.OnClientEvent:Connect(function(...)
+            recorder.ServerComplete({Remote=complete,Arguments=table.pack(...),State=snapshot(false)})
+            recorder.Flush(lastWorld)
+        end)
+    end
     for _,remote in pairs({pick,hand})do if remote and remote:IsA("RemoteEvent")then
         feedbackConnections[#feedbackConnections+1]=remote.OnClientEvent:Connect(function(...)
             if remote==pickRemote and not exposed and player:GetAttribute("NeedleOwned")~=true then return end
             record("ObservedRemoteFeedback",{Remote=remote,Arguments=table.pack(...)})
         end)
     end end
-    record("RemotesChanged",{PickHay=pick,NeedleHandIn=hand})
+    record("RemotesChanged",{PickHay=pick,NeedleHandIn=hand,NeedleRoundCompleted=complete})
 end
 local interceptor=env.__BEYY_NEEDLE_LATENCY_INTERCEPTOR
 if type(interceptor)~="table"or interceptor.JobId~=game.JobId or interceptor.PlaceId~=game.PlaceId then
@@ -303,7 +396,7 @@ run.Hooks.NamecallInstalled=interceptor.Installed==true;run.Hooks.NamecallError=
 run.Hooks.LoggingMode="Deferred: original namecall forwards before observation"
 local function processObservation(remote,method,args,capturedAt)
     if not run.Running then return end
-    local data={Remote=remote,Arguments=args,SnapshotDelayMs=(now()-capturedAt)*1000}
+    local data={Remote=remote,Arguments=args,SnapshotDelayMs=(now()-capturedAt)*1000,ObservationContext=telemetry.Context()}
     if method=="FireServer"and remote==pickRemote and(args[1]=="Objective"or exposed and args[1]==exposed:GetAttribute("HayId"))then
         data.State=snapshot(true);recorder.Request("Pickup",data,capturedAt)
     elseif method=="FireServer"and remote==handInRemote then
@@ -351,7 +444,7 @@ task.spawn(function()
     if ok and run.Running and type(source)=="string"and type(loadstring(source))=="function"then pcall(writefile,CACHE_PATH,source)end
 end)
 hook(player.AttributeChanged:Connect(function(name)
-    if name=="NeedleOwned"then recorder.Ownership(player:GetAttribute(name)==true,false)
+    if name=="NeedleOwned"then sampleMovement(true);recorder.Ownership(player:GetAttribute(name)==true,false)
     elseif name=="NeedleRoundComplete"and player:GetAttribute(name)==true then recorder.RoundComplete()
     elseif name=="CutsceneActive"or name=="NeedleInputLocked"or name=="HintViewerOpen"
         or name=="HoveredHayId"and(exposed or player:GetAttribute("NeedleOwned")==true)then
@@ -359,6 +452,12 @@ hook(player.AttributeChanged:Connect(function(name)
     end
 end))
 hook(player.CharacterAdded:Connect(function(char)record("CharacterAdded",{Character=char})end))
+hook(RunService.Heartbeat:Connect(function(dt)
+    if not run.Running then return end
+    telemetry.Frame(dt)
+    -- Small position samples only; no raycasts, debug scans, or disk writes here.
+    if player:GetAttribute("NeedleOwned")==true or exposed then sampleMovement(false)end
+end))
 hook(player.OnTeleport:Connect(function(state)
     record("Teleport",{State=tostring(state),QueueInstalled=run.QueueInstalled});recorder.Flush(lastWorld)
 end))
@@ -371,7 +470,7 @@ end
 function run.Export()return recorder.Flush(lastWorld)end
 record("SessionStarted",{BootWaitMs=(os.clock()-boot)*1000,QueueInstalled=run.QueueInstalled,
     PriorSession=old and old.SessionId,Version=RECORDER_VERSION,HookStatus=run.Hooks,JobId=game.JobId})
-bindRemoteObserver();bindNeedle();discoverControllers()
+bindRemoteObserver();bindNeedle();discoverControllers();sampleMovement(true)
 if player:GetAttribute("NeedleOwned")==true then recorder.Ownership(true,true)end
 recorder.Flush(snapshot(false))
 print("[Needle Trace] Standalone recording enabled | "..LOG_PATH.." | queue="..tostring(run.QueueInstalled))
@@ -380,6 +479,7 @@ task.spawn(function()
     while run.Running and env.BeyyNeedleLatency==run do
         local t=os.clock()
         local ok,err=pcall(function()
+            telemetry.PollPing(false)
             if t>=nextScan then nextScan=t+.5;bindRemoteObserver();bindNeedle();discoverControllers();updateExposure()end
             local active=exposed~=nil or player:GetAttribute("NeedleOwned")==true
             if t>=nextSample then
