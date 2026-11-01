@@ -13,17 +13,11 @@ if game.PlaceId ~= 83445806734780 then
     return
 end
 
--- Chapter 2 integrated v33. This is the SAME four-module launcher as
--- chapter2-no-levers-cutscene-test.lua, embedded without an extra HTTP fetch.
--- Replaces the legacy 2,000-line v23 puzzle/cutscene controller entirely.
+-- Chapter 2 integrated puzzle and independent cutscene workers.
+-- Cash and gem upgrades belong to the shared hub scheduler.
 local __BEYY_CH2_NO_LEVERS_RUN = function(cancelled,cutsceneOnly)
     cancelled = cancelled or function() return false end
--- Beyy Chapter 2 Standalone Integrated v33 (v32 puzzles / v6 invisible Skip / v9 return / v27 VacuumPower)
--- Canonical Chapter 2 standalone entry point; replaces legacy v26 workflow.
--- Same four components as the latest tested experiment:
--- v32 no-levers Picture/Color/Number, v6 deferred/invisible native intro Skip,
--- v9 immediate spawn return/snapback correction and v27 VacuumPower only.
--- Also embedded by BeyyHub Main to guarantee feature parity.
+-- Keep puzzle/cutscene modules independent of selected cash and gem upgrades.
 local LOBBY=77108422251420
 local CHAPTER2=83445806734780
 local URL="https://raw.githubusercontent.com/BeyyTU/needlehub/main/chapter2-no-levers-cutscene-test.lua"
@@ -36,9 +30,6 @@ local paths={
     {name="PUZZLES",file="chapter2-no-levers-puzzles-dual-range-test.lua",
         marker="Beyy Chapter 2 No-Levers Puzzle Worker v32 DUAL RANGE TEST",
         cache="BeyyHub/chapter2_integrated_v33_puzzles_v32.lua"},
-    {name="UPGRADES",file="chapter2-auto-upgrades.lua",
-        marker="Beyy Chapter 2 Auto Upgrades v27 (Vacuum Power only)",
-        cache="BeyyHub/chapter2_integrated_v33_vacuum_v27.lua"},
 }
 local function log(line)
     print("[CH2 HOLD TEST] "..tostring(line))
@@ -142,7 +133,7 @@ if game.PlaceId==LOBBY then
     if not ok then
         fail("queue_on_teleport failed: "..tostring(err))
     else
-        log("Four modules compiled and compact hold-test bootstrap queued. Enter Chapter 2.")
+        log("Puzzle/cutscene modules compiled and compact hold-test bootstrap queued. Enter Chapter 2.")
     end
     return
 end
@@ -180,14 +171,11 @@ else
     okPuzzle=launch(paths[2])
 end
 if cancelled() then return false end
-local okUpgrade=launch(paths[3])
-if cancelled() then return false end
-if not okPuzzle or not okUpgrade then
-    fail("Partial puzzle startup: puzzle="..tostring(okPuzzle)..
-        " upgrades="..tostring(okUpgrade)..". Check console for exact module error.")
+if not okPuzzle then
+    fail("Puzzle startup failed. Check console for exact module error.")
     return false
 end
-log("Puzzle/VacuumPower workers running; no automatic return to spawn. Cutscene bypass preserves the current transition pose.")
+log("Puzzle worker running; shared upgrade scheduler handles Vacuum Power and selected upgrades. No automatic return to spawn.")
 return true
 end
 local __BEYY_CH2_NO_LEVERS_STARTED = false
@@ -1122,6 +1110,7 @@ do
     upgradesTab:Section({ Title="Capacity (Cash)" })
     farmToggle(upgradesTab,"UpgCapacity","Auto Upgrade Carry Capacity")
 
+    local upgradeStatus=upgradesTab:Paragraph({Title="Auto Upgrade Status",Desc="Waiting for upgrade check"})
     local needleFolder = ReplicatedStorage:FindFirstChild("NeedleHaystack")
     local sharedGameConfig, sharedUpgradeConfig
     if needleFolder then
@@ -2257,7 +2246,6 @@ do
     
     
     
-    local upgradePurchaseAttempts={}
     local permanentPurchaseAttempts={}
     local lastUpgradeConfirmedAt
     local function logUpgradeConfirmation(category,name,pending,level)
@@ -2267,32 +2255,7 @@ do
         print(string.format("[BeyyHub Upgrade] %s %s L%d->L%d confirmed after %.3fs%s",
             category,name,pending.level,level,now-pending.at,spacing))
     end
-    local function tryTrack(name)
-        if __BEYY_CH2_NO_LEVERS_STARTED then return end
-        if not sharedGameConfig then return end
-        local track=sharedGameConfig.UPGRADE_TRACKS and sharedGameConfig.UPGRADE_TRACKS[name]
-        if not track then return end
-        local level=tonumber(LocalPlayer:GetAttribute("HayUpgrade"..name)) or 1
-        local previous=upgradePurchaseAttempts[name]
-        if previous and level~=previous.level then
-            if level>previous.level then logUpgradeConfirmation("Cash",name,previous,level) end
-            upgradePurchaseAttempts[name]=nil
-        end
-        if level>=#track.Levels then return end
-        local nextLevel=track.Levels[level+1]
-        if nextLevel then
-            local price=(tonumber(nextLevel.Cost) or 0)*(tonumber(LocalPlayer:GetAttribute("UpgradeCostMultiplier")) or 1)
-            if name:sub(1,9)=="Pitchfork" then price*=tonumber(LocalPlayer:GetAttribute("PitchforkUpgradeCostMultiplier")) or 1 end
-            if cash()<price then return end
-            local now=os.clock()
-            local pending=upgradePurchaseAttempts[name]
-            if pending and pending.level==level and now-pending.at<0.05 then return end
-            upgradePurchaseAttempts[name]={level=level,at=now}
-            if not sendFarmRemote("BuyUpgrade",name) then upgradePurchaseAttempts[name]=nil end
-        end
-    end
     local function tryPermanent(name)
-        if __BEYY_CH2_NO_LEVERS_STARTED then return end
         if not sharedUpgradeConfig then return end
         local ok,upgrade=pcall(function() return sharedUpgradeConfig.getUpgrade(name) end)
         if not ok or not upgrade then return end
@@ -2336,7 +2299,7 @@ do
                     elseif name=="Infinite Bag" and not owned("InfiniteBagOwned") then
                         sendFarmRemote("BuyShopItem","InfiniteBag")
                     elseif name=="Capacity Bag" then
-                        tryTrack("Capacity")
+                        -- Capacity purchases are serialized by the central queue.
                     end
                 end
             end
@@ -2355,14 +2318,23 @@ do
         end
     end)
     do
+        local upgradeState=setmetatable({}, {__index=function(_,flag)
+            if flag=="UpgVacPower"and __BEYY_CH2_NO_LEVERS_WANTED and not __BEYY_CH2_NO_LEVERS_FAILED then return true end
+            if flag=="UpgCapacity"and sharedFarmState.AutoBuyTools then
+                for key,value in pairs(sharedFarmState.BuyToolsList or{})do
+                    if(type(key)=="number"and value=="Capacity Bag")or(key=="Capacity Bag"and value==true)then return true end
+                end
+            end
+            return sharedFarmState[flag]
+        end})
         local upgrades=createAutoUpgradeRuntime({
-            State=sharedFarmState,Player=LocalPlayer,Cash=cash,
+            State=upgradeState,Player=LocalPlayer,Cash=cash,
             Folder=function()
-                needleFolder=needleFolder or ReplicatedStorage:FindFirstChild("NeedleHaystack")
+                needleFolder=ReplicatedStorage:FindFirstChild("NeedleHaystack")
                 return needleFolder
             end,
             OnConfig=function(config)sharedGameConfig=config end,
-            Status=function()end,
+            Status=function(text)if not hubUnloaded then upgradeStatus:SetDesc(text)end end,
             OnConfirmed=function(pending,current)
                 logUpgradeConfirmation("Cash",pending.Name,
                     {level=pending.Level,at=pending.Started},current)
@@ -2371,9 +2343,8 @@ do
         task.spawn(function()
             local wake=createWorkerWake(LocalPlayer)
             while not hubUnloaded do
-                -- VacuumPower-only standalone v27 handles cash upgrades while
-                -- integrated v33 is active; never send duplicate purchases.
-                if not __BEYY_CH2_NO_LEVERS_STARTED then upgrades.Tick() end
+                -- One queue handles the puzzle preset and every selected cash track.
+                upgrades.Tick()
                 wake.Wait(0.05,upgrades.IsIdle(),upgrades.WaitKey())
             end
             wake.Stop()
@@ -3793,3 +3764,4 @@ end
     print(("[BeyyHub Startup] %s controls and features registered after %.2fs in module"):format(
         BEYY_CHAPTER, os.clock() - __BEYY_BOOT_T0))
 end
+
