@@ -34,7 +34,11 @@ local function createLeaderboardCapture(options)
             end end
         end end
         report.PlannedLeaderboardRequests=#jobs
+        report.ExpectedBoards={}
+        for index,job in ipairs(jobs)do report.ExpectedBoards[index]={Order=index,Board=job.Model,Category=job.Category,
+            Kind=job.Kind,Map=job.Map,Difficulty=job.Difficulty,Period=job.Period,Mode=job.Mode,Status="loading"}end
         local function publish()options.Checkpoint(report)end
+        publish()
         local function failed(scope,reason)
             report.Errors[#report.Errors+1]={Scope=scope,Reason=tostring(reason),At=options.Timestamp()}
         end
@@ -95,8 +99,11 @@ local function createLeaderboardCapture(options)
             else report.MyClan={Status="failed",Reason="Incomplete clan state"};failed("MyClan","Incomplete clan state")end
         else report.MyClan={Status="failed",Reason=stateErr};failed("MyClan",stateErr)end
         publish()
-        for index,job in ipairs(jobs)do
+        local concurrency=math.clamp(math.floor(tonumber(options.Concurrency)or 1),1,#jobs)
+        report.Parallelism=concurrency;report.StartedLeaderboardRequests=0;report.CompletedLeaderboardRequests=0
+        local function process(index,job)
             if not options.Alive()then return end
+            report.StartedLeaderboardRequests+=1
             local started=options.Timestamp()
             local response,reason,requestFatal=call(job.Category,"GetBoard",job.Args,function(r)
                 assert(type(r)=="table"and type(r.Rows)=="table","Missing board rows")
@@ -109,7 +116,7 @@ local function createLeaderboardCapture(options)
                 end
             end)
             if not options.Alive()then return end
-            local entry={Board=job.Model,Category=job.Category,Kind=job.Kind,Map=job.Map,Difficulty=job.Difficulty,
+            local entry={Order=index,Board=job.Model,Category=job.Category,Kind=job.Kind,Map=job.Map,Difficulty=job.Difficulty,
                 Period=job.Period,Mode=job.Mode,StartedAt=started,ObservedAt=options.Timestamp()}
             if response then
                 entry.Status=#response.Rows>0 and "ok"or "empty";entry.Rows=response.Rows;entry.RowCount=#response.Rows
@@ -118,13 +125,35 @@ local function createLeaderboardCapture(options)
                 entry.ServerMetadata=metadata
             else entry.Status="failed";entry.Reason=reason;failed(job.Model..":"..table.concat(job.Args,":"),reason)end
             report.Leaderboards[#report.Leaderboards+1]=entry
-            report.CompletedLeaderboardRequests=index
-            options.Progress(index,#jobs,entry)
-            if requestFatal then
-                report.Status="partial";report.FinishedAt=options.Timestamp();publish();return
-            end
-            if index%5==0 then publish()end
+            report.CompletedLeaderboardRequests+=1
+            options.Progress(report.CompletedLeaderboardRequests,#jobs,entry)
+            if report.CompletedLeaderboardRequests%5==0 then publish()end
         end
+        if concurrency==1 then
+            for index,job in ipairs(jobs)do if not options.Alive()then return end;process(index,job)end
+        else
+            assert(type(options.Spawn)=="function","Parallel capture needs a task scheduler")
+            local cursor,workers=1,concurrency
+            for _=1,concurrency do options.Spawn(function()
+                while options.Alive()do
+                    local index=cursor;cursor+=1
+                    if index>#jobs then break end
+                    local job=jobs[index]
+                    local ok,err=pcall(process,index,job)
+                    if not ok and options.Alive()then
+                        failed(job.Model..":"..table.concat(job.Args,":"),"Worker error: "..tostring(err))
+                        report.Leaderboards[#report.Leaderboards+1]={Order=index,Board=job.Model,Category=job.Category,
+                            Kind=job.Kind,Map=job.Map,Difficulty=job.Difficulty,Period=job.Period,Mode=job.Mode,
+                            Status="failed",Reason=tostring(err),ObservedAt=options.Timestamp()}
+                        report.CompletedLeaderboardRequests+=1
+                    end
+                end
+                workers-=1
+            end)end
+            while workers>0 and options.Alive()do options.Wait(0.05)end
+        end
+        if not options.Alive()then return end
+        table.sort(report.Leaderboards,function(a,b)return a.Order<b.Order end)
         report.Status=#report.Errors==0 and "complete"or "partial"
         report.FinishedAt=options.Timestamp();publish()
     end
@@ -144,7 +173,7 @@ local DASHBOARD_TEMPLATE=[====[<!doctype html>
 <div id="notice"></div><div class="section-title"><h2>Clans</h2><small>Clan totals keep the server’s original period meaning.</small></div><div class="clans" id="clans"></div>
 <div class="section-title"><h2>Leaderboards</h2><small id="boardCount"></small></div><div class="grid" id="boards"></div>
 <details id="errors"><summary id="errorSummary"></summary><div id="errorList" class="details"></div></details>
-<footer>Local files only · Values are captured sequentially, not at one instant · Empty leaderboards are valid · Page refresh reloads this HTML file; Roblox must keep running the recorder to collect new data.</footer>
+<footer>Local files only · Boards load concurrently and each records its own capture time · Empty leaderboards are valid · Page refresh reloads this HTML file; Roblox must keep running the recorder to collect new data.</footer>
 </main><script id="data" type="application/json">__LEADERBOARD_PAYLOAD__</script>
 <script>
 (()=>{'use strict';
@@ -155,8 +184,8 @@ const pretty=v=>String(v||'').replaceAll('_',' ').toLowerCase().replace(/\b\w/g,
 const time=v=>{const ms=Math.round(Number(v)*1000),seconds=Math.floor(ms/1000);return `${Math.floor(seconds/3600).toString().padStart(2,'0')}:${Math.floor(seconds%3600/60).toString().padStart(2,'0')}:${(seconds%60).toString().padStart(2,'0')}${ms%1000?'.'+(ms%1000).toString().padStart(3,'0'):''}`};
 const node=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n};
 const key=b=>[b.Category,b.Kind,b.Map,b.Difficulty,b.Period,b.Mode].join('|');
-const merged=new Map((previous.Leaderboards||[]).map(b=>[key(b),{...b,Cached:true}]));for(const b of report.Leaderboards||[])merged.set(key(b),b);
-const boards=[...merged.values()];let stored={};try{stored=JSON.parse(localStorage.getItem('needle-leaderboard-view')||'{}')}catch{}
+const merged=new Map((report.ExpectedBoards||[]).map(b=>[key(b),b]));for(const b of previous.Leaderboards||[])if(b.Status==='ok'||b.Status==='empty')merged.set(key(b),{...b,Cached:true});for(const b of report.Leaderboards||[])merged.set(key(b),b);
+const boards=[...merged.values()].sort((a,b)=>(a.Order??999)-(b.Order??999));let stored={};try{stored=JSON.parse(localStorage.getItem('needle-leaderboard-view')||'{}')}catch{}
 const inputs=['search','period','category','map','difficulty','mode'];
 function choices(id,values){for(const value of [...new Set(values.filter(Boolean))]){const o=node('option',pretty(value));o.value=value;$(id).append(o)}}
 choices('period',report.Configuration?.Periods||boards.map(b=>b.Period));choices('map',report.Configuration?.Maps||boards.map(b=>b.Map));choices('difficulty',report.Configuration?.Difficulties||boards.map(b=>b.Difficulty));choices('mode',report.Configuration?.Modes||boards.map(b=>b.Mode));
@@ -167,7 +196,8 @@ const statusText=report.RecorderStopped?'Recorder stopped':report.Status==='runn
 $('updated').textContent=`Started ${report.StartedAt||'—'}${report.FinishedAt?' · Finished '+report.FinishedAt:''} · This page was saved ${payload.SavedAt||'—'}`;
 function metric(value,title){const box=node('div',undefined,'metric');box.append(node('strong',value),node('span',title,'muted'));$('metrics').append(box)}
 metric(`${report.CompletedLeaderboardRequests||0} / ${report.PlannedLeaderboardRequests||'—'}`,'Board combinations captured');metric(format(boards.reduce((n,b)=>n+(b.Rows?.length||0),0)),'Ranking rows available');metric(format((report.Errors||[]).length),'Capture errors');metric(payload.NextCaptureAt?new Date(payload.NextCaptureAt*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):report.Status==='running'?'In progress':'Stopped','Next capture');
-if(report.Status==='running')$('notice').append(node('div','Collection is in progress. Boards marked “previous capture” remain visible until their new results arrive. Requests are paced to avoid rapid retries.','notice'));
+if(report.Parallelism)metric(format(report.PeakConcurrentReads||0),'Peak parallel reads');
+if(report.Status==='running')$('notice').append(node('div','Boards are loading independently. Slow boards do not hold up the others. Results marked “previous capture” remain visible until their new data arrives.','notice'));
 if(payload.RefreshSeconds===0&&report.Status!=='running')$('notice').append(node('div','This was a one-off capture. Run the script again for new data.','notice'));
 function table(headers,rows){const table=node('table'),head=node('thead'),tr=node('tr');for(const h of headers)tr.append(node('th',h));head.append(tr);table.append(head);const body=node('tbody');for(const row of rows){const tr=node('tr');if(row[0]===1)tr.className='gold';for(let i=0;i<row.length;i++){const td=node('td');if(row[i] instanceof Node)td.append(row[i]);else td.textContent=format(row[i]);tr.append(td)}body.append(tr)}table.append(body);const wrap=node('div',undefined,'table-wrap');wrap.append(table);return wrap}
 function nameCell(primary,secondary){const n=node('div',primary,'name');if(secondary)n.append(node('small',secondary));return n}
@@ -179,7 +209,7 @@ if(clan.Status==='failed')mine.append(node('div',clan.Reason||'Clan capture fail
 const ranking=card('Top 20 clans',`${top.CapturedCount||0} captured · Server ranking order`);if(top.Rows?.length)ranking.append(table(['Rank','Clan','Wins'],top.Rows.filter(r=>matches(r,q)).map(r=>[r.Rank,nameCell(`${r.Tag?'['+r.Tag+'] ':''}${r.Name}`,`${r.MemberCount??'—'} members`),r.Wins])));else ranking.append(node('div',top.Reason||'Waiting for clan rankings…','empty'));$('clans').append(mine,ranking)}
 function render(){const q=$('search').value.trim().toLowerCase();renderClans(q);$('boards').replaceChildren();const selected=boards.filter(b=>(!$('period').value||b.Period===$('period').value)&&(!$('category').value||b.Category===$('category').value)&&(!$('map').value||b.Map===$('map').value)&&(!$('difficulty').value||b.Difficulty===$('difficulty').value)&&(!$('mode').value||b.Mode===$('mode').value));let shown=0;
 for(const b of selected){const rows=(b.Rows||[]).filter(r=>matches(r,q));if(q&&!rows.length)continue;shown++;const title=b.Category==='TimeBoard'?`${pretty(b.Map)} · ${pretty(b.Difficulty)} · ${pretty(b.Mode)}`:labels[b.Kind]||b.Board;const c=card(title,`${pretty(b.Period)} · ${b.Cached?'Previous capture · ':''}${b.ObservedAt||''}`);
-if(b.Status==='failed')c.append(node('div',b.Reason||'Request failed.','empty error'));else if(!rows.length)c.append(node('div','No records returned for this combination.','empty'));else{const visible=expanded.has(key(b))?rows:rows.slice(0,10);c.append(table(['Rank','Player',b.Category==='TimeBoard'?'Time':b.Kind==='GARDEN_BIGGEST'?'Weight':'Value'],visible.map(r=>{let value=r.Value;if(b.Category==='TimeBoard')value=time(r.Seconds);else if(b.Kind==='GARDEN_BIGGEST')value=format(value)+' kg';const names=r.Username||r.Name||(r.UserId?'User '+r.UserId:JSON.stringify(r.UserIds||r));const partner=r.PartnerUsername||r.PartnerName||r.Username2;return[r.Rank,nameCell(names,partner?'with '+partner:''),value]})));
+if(b.Status==='loading')c.append(node('div','Loading this board…','empty'));else if(b.Status==='failed')c.append(node('div',b.Reason||'Request failed.','empty error'));else if(!rows.length)c.append(node('div','No records returned for this combination.','empty'));else{const visible=expanded.has(key(b))?rows:rows.slice(0,10);c.append(table(['Rank','Player',b.Category==='TimeBoard'?'Time':b.Kind==='GARDEN_BIGGEST'?'Weight':'Value'],visible.map(r=>{let value=r.Value;if(b.Category==='TimeBoard')value=time(r.Seconds);else if(b.Kind==='GARDEN_BIGGEST')value=format(value)+' kg';const names=r.Username||r.Name||(r.UserId?'User '+r.UserId:JSON.stringify(r.UserIds||r));const partner=r.PartnerUsername||r.PartnerName||r.Username2;return[r.Rank,nameCell(names,partner?'with '+partner:''),value]})));
 const foot=node('div',`${rows.length} row${rows.length===1?'':'s'}${q?' matching search':''}`,'foot');if(rows.length>10){const button=node('button',expanded.has(key(b))?'Show top 10':'Show all '+rows.length);button.onclick=()=>{expanded.has(key(b))?expanded.delete(key(b)):expanded.add(key(b));remember();render()};foot.append(button)}c.append(foot)}$('boards').append(c)}
 $('boardCount').textContent=`${shown} board combinations shown`;if(!shown)$('boards').append(node('div',report.Status==='running'?'Waiting for leaderboard responses…':'No boards match these filters.','empty'));remember()}
 for(const id of inputs)$(id).addEventListener(id==='search'?'input':'change',render);$('auto').addEventListener('change',remember);$('reload').onclick=()=>{remember();location.reload()};window.addEventListener('beforeunload',remember);
@@ -190,7 +220,8 @@ render();if(stored.scroll)requestAnimationFrame(()=>window.scrollTo(0,stored.scr
 ]====]
 -- Standalone local leaderboard + clan recorder with an offline HTML dashboard.
 -- Only verified native GetBoard, GetState, GetTop and Find read requests are used.
-local SETTINGS={RequestSpacing=1.25,RequestTimeout=120,RefreshSeconds=300,Folder="BeyyHub"}
+-- Ten simultaneous reads is the default; set Concurrency=100 to repeat the full-burst experiment.
+local SETTINGS={Concurrency=10,ClanRequestSpacing=1.25,RequestTimeout=120,RefreshSeconds=300,Folder="BeyyHub"}
 if game.PlaceId~=77108422251420 then warn("[Leaderboard Logger] Run this script in the lobby.");return end
 local Http=game:GetService("HttpService")
 local Storage=game:GetService("ReplicatedStorage")
@@ -200,11 +231,11 @@ pcall(function()if type(makefolder)=="function"then makefolder(SETTINGS.Folder)e
 local env=type(getgenv)=="function"and getgenv()or _G
 local old=env.BeyyLeaderboardLogger
 local inheritedReport=type(old)=="table"and old.Report or nil
-local inheritedPending=type(old)=="table"and old.Pending or nil
+local inheritedRequests=type(old)=="table"and old.InFlight or nil
 if type(old)=="table"and type(old.Stop)=="function"then pcall(old.Stop)end
-local run={Running=true,Capturing=false,RequestCount=0,HtmlPath=SETTINGS.Folder.."/leaderboards.html"}
+local run={Running=true,Capturing=false,RequestCount=0,PeakRequests=0,InFlight=inheritedRequests or{},HtmlPath=SETTINGS.Folder.."/leaderboards.html"}
 env.BeyyLeaderboardLogger=run
-local report,previous,inFlight=nil,inheritedReport,inheritedPending
+local report,previous=nil,inheritedReport
 local function alive()return run.Running and env.BeyyLeaderboardLogger==run and game.PlaceId==77108422251420 end
 local function timestamp()return os.date("!%Y-%m-%dT%H:%M:%SZ")end
 local function wait(seconds)
@@ -214,6 +245,7 @@ end
 local function save()
     if not report or env.BeyyLeaderboardLogger~=run then return false end
     report.RequestCount=run.RequestCount
+    report.PeakConcurrentReads=run.PeakRequests
     local ok,json=pcall(Http.JSONEncode,Http,report)
     if not ok then warn("[Leaderboard Logger] JSON export failed: "..tostring(json));return false end
     local written,err=pcall(writefile,run.Path,json)
@@ -250,15 +282,9 @@ function run.Copy()
     return pcall(function()setclipboard(Http:JSONEncode(report))end)
 end
 teleportConnection=player.OnTeleport:Connect(function(state)if state==Enum.TeleportState.Started then run.Stop()end end)
-local nextRequest,fatal=0,false
+local nextClanRequest=0
 local function request(category,action,args)
-    if fatal then return false,"A request timed out; no more requests will be sent in this capture",true end
-    if inFlight and not inFlight.Done then
-        local untilAt=os.clock()+SETTINGS.RequestTimeout
-        while alive()and not inFlight.Done and os.clock()<untilAt do task.wait(0.05)end
-        if not inFlight.Done then fatal=true;return false,"A previous read request is still pending",true end
-    end
-    wait(math.max(0,nextRequest-os.clock()))
+    if category=="Clan"then wait(math.max(0,nextClanRequest-os.clock()))end
     if not alive()then return false,"Cancelled",true end
     local remote
     if category=="Clan"then
@@ -269,15 +295,44 @@ local function request(category,action,args)
         local folder=remotes and remotes:FindFirstChild(category);remote=folder and folder:FindFirstChild("RemoteFunction")
     end
     if not remote or not remote:IsA("RemoteFunction")then return false,"Missing "..category.." read remote"end
-    run.RequestCount+=1
-    local job={Done=false,Category=category,Action=action,StartedAt=timestamp()};inFlight=job;run.Pending=job
-    task.spawn(function()job.OK,job.Value=pcall(remote.InvokeServer,remote,action,table.unpack(args));job.Done=true end)
+    local key=category.."|"..action.."|"..table.concat(args,"|")
+    local job=run.InFlight[key]
+    if not job or job.Done then
+        local function activeCount()
+            local count=0;for _,pending in pairs(run.InFlight)do if not pending.Done then count+=1 end end;return count
+        end
+        local admissionDeadline=os.clock()+SETTINGS.RequestTimeout
+        while alive()and activeCount()>=SETTINGS.Concurrency and os.clock()<admissionDeadline do task.wait(0.05)end
+        if not alive()then return false,"Cancelled",true end
+        if activeCount()>=SETTINGS.Concurrency then return false,"Earlier reads still occupy all concurrency slots",true end
+        -- The same key can have been admitted by another worker while we waited.
+        job=run.InFlight[key]
+        if not job or job.Done then
+        run.RequestCount+=1
+        job={Done=false,Category=category,Action=action,Key=key,StartedAt=timestamp()};run.InFlight[key]=job;run.Pending=job
+        local count=0;for _,pending in pairs(run.InFlight)do if not pending.Done then count+=1 end end
+        run.PeakRequests=math.max(run.PeakRequests,count)
+        task.spawn(function()
+            job.OK,job.Value=pcall(remote.InvokeServer,remote,action,table.unpack(args));job.Done=true
+            if run.InFlight[key]==job then run.InFlight[key]=nil end
+        end)
+        end
+    end
     local deadline=os.clock()+SETTINGS.RequestTimeout
     while alive()and not job.Done and os.clock()<deadline do task.wait(0.05)end
-    nextRequest=os.clock()+SETTINGS.RequestSpacing
+    if category=="Clan"then nextClanRequest=os.clock()+SETTINGS.ClanRequestSpacing end
     if not alive()then return false,"Cancelled",true end
-    if not job.Done then fatal=true;return false,category.." read timed out; request queue halted",true end
+    if not job.Done then return false,category.." read timed out; other boards continue loading",true end
     return job.OK,job.Value
+end
+local queuedSave=false
+local function checkpoint()
+    if queuedSave then return end
+    queuedSave=true
+    task.delay(0.5,function()
+        queuedSave=false
+        if alive()and run.Capturing then save()end
+    end)
 end
 local function configuration()
     local shared=Storage:WaitForChild("Shared",15);assert(shared,"Shared configuration has not loaded")
@@ -293,13 +348,13 @@ local function configuration()
     return config
 end
 task.spawn(function()
-    print("[Leaderboard Logger] Dashboard: "..run.HtmlPath.." | Collecting all filters; requests are paced and may take several minutes.")
+    print("[Leaderboard Logger] Dashboard: "..run.HtmlPath.." | Loading up to "..SETTINGS.Concurrency.." leaderboard combinations concurrently.")
     while alive()do
         local id=os.date("!%Y%m%d_%H%M%S").."_"..Http:GenerateGUID(false):sub(1,8)
         report={Schema=1,CaptureId=id,Status="running",PlaceId=game.PlaceId,StartedAt=timestamp(),Leaderboards={},Errors={},
-            Interpretation="Native server responses captured sequentially, not an atomic snapshot. Empty boards are valid. Clan wins have no period label in the server response. MemberWinsSum is distinct from the clan's reported Wins."}
+            Interpretation="Native server responses captured concurrently, not an atomic snapshot. Empty boards are valid. Clan wins have no period label in the server response. MemberWinsSum is distinct from the clan's reported Wins."}
         run.Report=report;run.Path=SETTINGS.Folder.."/leaderboards_"..id..".json"
-        run.RequestCount=0;run.Capturing=true;run.NextCaptureAt=nil;fatal=false
+        run.RequestCount=0;run.PeakRequests=0;run.Capturing=true;run.NextCaptureAt=nil
         save()
         local ok,err=pcall(function()
             local config=configuration();report.Configuration=config
@@ -311,7 +366,8 @@ task.spawn(function()
             end end end
             report.DiscoveredBoards=discovered;report.UnsupportedBoards=unknown
             for _,name in ipairs(unknown)do report.Errors[#report.Errors+1]={Scope=name,Reason="Unknown board type; request mapping needs an update"}end
-            local capture=createLeaderboardCapture({Alive=alive,Request=request,Wait=wait,Timestamp=timestamp,Checkpoint=save,
+            local capture=createLeaderboardCapture({Alive=alive,Request=request,Wait=wait,Spawn=task.spawn,
+                Concurrency=SETTINGS.Concurrency,Timestamp=timestamp,Checkpoint=checkpoint,
                 Progress=function(index,total,entry)
                     if index==1 or index%10==0 or index==total or entry.Status=="failed"then
                         print(string.format("[Leaderboard Logger] %d/%d | %s | %s",index,total,entry.Board,entry.Status))
