@@ -3158,6 +3158,8 @@ end
             local watchedEncounter=nil
             local keyDown=nil
             local walkingHumanoid=nil
+            local walkingGoal=nil
+            local walkingRenderName=renderName.."_FinishWalk"
             local pigCenter=Vector3.new(-658.85,3.76,285.29)
             local pendingCause="none"
             local awaitCutsceneAt=0
@@ -3170,6 +3172,8 @@ end
                 return enabled() and hubWindow.Closed
             end
             local function stopMoving()
+                RunService:UnbindFromRenderStep(walkingRenderName)
+                walkingGoal=nil
                 if walkingHumanoid then
                     local humanoid=walkingHumanoid
                     walkingHumanoid=nil
@@ -3255,6 +3259,21 @@ end
                 }
                 local expiry=os.clock()+35
                 walkingHumanoid=humanoid
+                -- Maintain movement after native PlayerModule controls run. A one-shot
+                -- MoveTo can be cancelled by their next zero-input update.
+                RunService:BindToRenderStep(walkingRenderName,
+                    Enum.RenderPriority.Last.Value+21,function()
+                        if not available() or LocalPlayer.Character~=character
+                            or not root.Parent or humanoid.Health<=0 or finishConfirmed() then
+                            stopMoving()
+                            return
+                        end
+                        if walkingGoal then
+                            local delta=walkingGoal-root.Position
+                            local flat=Vector3.new(delta.X,0,delta.Z)
+                            humanoid:Move(flat.Magnitude>2 and flat.Unit or Vector3.zero,false)
+                        end
+                    end)
                 announce("HasCarKey verified; crossing pig trigger with 28-stud passes")
                 local completed=0
                 for index,offset in ipairs(crossings) do
@@ -3269,6 +3288,8 @@ end
                     end
                     local from=pigCenter+offset
                     local goal=pigCenter-offset
+                    walkingGoal=nil
+                    humanoid:Move(Vector3.zero,false)
                     root.CFrame=CFrame.lookAt(from,goal,Vector3.yAxis)
                     root.AssemblyLinearVelocity=Vector3.zero
                     root.AssemblyAngularVelocity=Vector3.zero
@@ -3282,6 +3303,7 @@ end
                         stopMoving()
                         return false,"Movement interrupted after positioning"
                     end
+                    walkingGoal=goal
                     humanoid:MoveTo(goal)
                     local legEnd=math.min(expiry,os.clock()+5)
                     local arrived=false
@@ -3300,6 +3322,8 @@ end
                         if arrived then break end
                         task.wait(0.05)
                     until os.clock()>=legEnd
+                    walkingGoal=nil
+                    humanoid:Move(Vector3.zero,false)
                     if arrived then completed+=1
                     else announce("Trigger crossing "..index.." did not reach endpoint; trying next approach") end
                     if os.clock()>=expiry then break end
