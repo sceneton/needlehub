@@ -2,6 +2,7 @@
 local __BEYY_MODULE = "Chapter2"
 local __BEYY_SCRIPT_VERSION = "103.00"
 -- Sceneton Chapter2 revision-aware workers v1
+-- Trapdoor turn-in v2: safe approach, replication settle and confirmed retries.
 local __BEYY_CH2_SOURCE_REVISION=...
 if type(__BEYY_CH2_SOURCE_REVISION)~="string"or #__BEYY_CH2_SOURCE_REVISION~=40
     or not __BEYY_CH2_SOURCE_REVISION:match("^%x+$")then __BEYY_CH2_SOURCE_REVISION=nil end
@@ -1961,13 +1962,21 @@ end
                 or not handInRequested() or keyInteractionBlocked()
                 or LocalPlayer:GetAttribute("NeedleOwned")~=true then return false end
             local puzzles=ReplicatedStorage:FindFirstChild("Puzzles")
-            if not puzzles or puzzles:GetAttribute("EscapeReady")~=true then return false end
-            local laser=Workspace:FindFirstChild("Laser")
+            if not puzzles or puzzles:GetAttribute("EscapeReady")~=true then
+                handInWarning("waiting for Puzzles.EscapeReady; owned key retained")
+                return false
+            end
+            local trapdoor=Workspace:FindFirstChild("Trapdoor")
             local root=farmRoot()
             local completedRemote=farmRemote("NeedleRoundCompleted")
-            if not root or not laser or not laser:IsA("Model") or not completedRemote then return false end
+            if not root or not trapdoor or not (trapdoor:IsA("Model") or trapdoor:IsA("BasePart")) or not completedRemote then
+                handInWarning("waiting for character, Trapdoor or NeedleRoundCompleted remote")
+                return false
+            end
+            if LocalPlayer:GetAttribute("NeedleRoundComplete")==true then return true end
             handInBusy=true
             local completed=false
+            local function confirmed()return completed or LocalPlayer:GetAttribute("NeedleRoundComplete")==true end
             local connection=completedRemote.OnClientEvent:Connect(function(userId)
                 if tonumber(userId)==LocalPlayer.UserId then completed=true end
             end)
@@ -1975,35 +1984,45 @@ end
             local attempts=0
             local ok,err=xpcall(function()
                 releaseSharedVacuum()
-                root.CFrame=CFrame.new(laser:GetPivot().Position-Vector3.new(0,2.5,0))*root.CFrame.Rotation
-                root.AssemblyLinearVelocity=Vector3.zero
-                root.AssemblyAngularVelocity=Vector3.zero
-                task.wait(0.05)
-                for attempt=1,3 do
-                    if completed or hubUnloaded or not handInRequested() then break end
+                local target=trapdoor:GetPivot().Position
+                -- Stand above the closed hatch instead of inside the laser below it.
+                if (root.Position-target).Magnitude>10 then
+                    root.CFrame=CFrame.new(target+Vector3.new(0,3.5,0))*root.CFrame.Rotation
+                    root.AssemblyLinearVelocity=Vector3.zero
+                    root.AssemblyAngularVelocity=Vector3.zero
+                    task.wait(0.375)
+                end
+                for attempt=1,16 do
+                    if confirmed() or hubUnloaded or not handInRequested() then break end
                     if keyInteractionBlocked() or farmRoot()~=root then break end
                     if LocalPlayer:GetAttribute("NeedleOwned")~=true then
-                        waitUntil(function() return completed end,0.70)
+                        waitUntil(confirmed,0.70)
                         break
                     end
-                    -- Disable the existing bypass before sending the request
-                    -- that starts the final cinematic.
-                    if autoCutsceneDisableAfterHandIn then
+                    local distance=(root.Position-trapdoor:GetPivot().Position).Magnitude
+                    if distance>24 then
+                        handInWarning(("outside native trapdoor range (%.1f studs); retrying approach"):format(distance))
+                        break
+                    end
+                    if autoCutsceneDisableAfterHandIn and attempt==1 then
                         autoCutsceneDisableAfterHandIn("NeedleHandIn requested")
                     else finalEndingProtected=true end
                     attempts=attempt
                     assert(sendFarmRemote("NeedleHandIn"),"NeedleHandIn remote unavailable")
-                    if waitUntil(function() return completed end,0.70) then break end
-                    if not hubUnloaded then task.wait(0.15) end
+                    if attempt==1 then
+                        print(("[BeyyHub Key] Trapdoor turn-in requested; distance=%.2f EscapeReady=true"):format(distance))
+                    end
+                    if waitUntil(confirmed,0.1875) then break end
                 end
             end,function(e) return tostring(e) end)
             connection:Disconnect()
             handInBusy=false
+            completed=confirmed()
             if completed then
                 finalEndingProtected=true
                 postPuzzleKeyPriority=false
                 keyObjectiveLatched=false
-                print(("[BeyyHub Key] Turn-in confirmed by NeedleRoundCompleted in %.3fs (%d requests)"):format(os.clock()-started,attempts))
+                print(("[BeyyHub Key] Turn-in confirmed by native round completion in %.3fs (%d requests)"):format(os.clock()-started,attempts))
             elseif not hubUnloaded then
                 handInWarning(ok and "native round-completion event not confirmed; waiting to retry" or tostring(err))
             end
@@ -2049,7 +2068,15 @@ end
     task.spawn(function()
         while not hubUnloaded do
             task.wait(BEYY_CHAPTER=="Chapter2" and 0.01 or (handInRequested() and 0.12 or 0.5))
-            if needleFolder and not keyInteractionBlocked() and handInRequested()
+            if BEYY_CHAPTER=="Chapter2" and handInRequested()
+                and LocalPlayer:GetAttribute("NeedleOwned")==true
+                and LocalPlayer:GetAttribute("NeedleRoundComplete")~=true and keyInteractionBlocked() then
+                handInWarning("blocked: puzzleCamera="..tostring(keyPuzzleCameraBusy())
+                    .." inputLocked="..tostring(LocalPlayer:GetAttribute("NeedleInputLocked"))
+                    .." cutscene="..tostring(LocalPlayer:GetAttribute("CutsceneActive"))
+                    .." hintViewer="..tostring(LocalPlayer:GetAttribute("HintViewerOpen")))
+            end
+            if not keyInteractionBlocked() and handInRequested()
                 and not needleBusy and not handInBusy
                 and LocalPlayer:GetAttribute("NeedleOwned")==true then
                 handInBusy = true
@@ -4017,5 +4044,4 @@ end
     print(("[BeyyHub Startup] %s controls and features registered after %.2fs in module"):format(
         BEYY_CHAPTER, os.clock() - __BEYY_BOOT_T0))
 end
-
 
