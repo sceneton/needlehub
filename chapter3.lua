@@ -3018,7 +3018,7 @@ end
     local function installChapter3BossCombat()
         local tab=hubWindow:Tab({Title="Chapter 3 Boss",Icon="swords"})
         farmToggle(tab,"AutoBossFight","Auto Boss Fight",
-            "Cooldown-paced pitchfork hits at exposed boss weak points. Starts OFF.")
+            "Hover within pitchfork range of exposed weak points and send cooldown-paced hits. Starts OFF.")
         farmToggle(tab,"AutoBossBodyHits","Hit Body Between Weak Points",
             "Attack Chest/Pelvis while no critical point is available.")
         farmToggle(tab,"AutoBossVacuum","Use Vacuum During Boss",
@@ -3128,11 +3128,58 @@ end
                 end
             end)
         end
+        local weakHover=(function()
+            local direction=nil
+            local trackedBoss=nil
+            return function()
+                local boss=bossState()
+                if combatLocked() or not boss then direction=nil;trackedBoss=nil;return end
+                local name=boss:GetAttribute("BossWeakPoint")
+                local ends=tonumber(boss:GetAttribute("BossWeakPointEndsAt"))
+                if type(name)~="string" or name==""
+                    or (ends and Workspace:GetServerTimeNow()>=ends
+                        and boss:GetAttribute("BossWeakPointDizzy")~=true) then
+                    direction=nil;trackedBoss=nil;return
+                end
+                local character=LocalPlayer.Character
+                local root=character and character:FindFirstChild("HumanoidRootPart")
+                local head=character and character:FindFirstChild("Head")
+                local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+                local bone=findBone(boss,name)
+                if not root or not head or not humanoid or humanoid.Health<=0
+                    or root.Anchored or not bone then direction=nil;return end
+                local target=bone.TransformedWorldCFrame.Position
+                local cfg=bossFolder and bossFolder:FindFirstChild("Config")
+                local minReach=13
+                if cfg and cfg:IsA("ModuleScript") then
+                    local ok,values=pcall(require,cfg)
+                    if ok and type(values)=="table" then minReach=tonumber(values.PitchforkRange) or minReach end
+                end
+                local range=math.clamp(tonumber(LocalPlayer:GetAttribute("PitchforkReach")) or minReach,minReach,24)
+                if not direction or trackedBoss~=boss then
+                    local delta=root.Position-target
+                    local flat=Vector3.new(delta.X,0,delta.Z)
+                    direction=flat.Magnitude>0.1 and flat.Unit or Vector3.new(0,0,1)
+                    trackedBoss=boss
+                end
+                -- Measure reach from the player's head, matching PitchforkDig's origin.
+                local eye=target+direction*(range*0.65)+Vector3.new(0,math.min(2,range*0.15),0)
+                local position=eye-(head.Position-root.Position)
+                if (root.Position-position).Magnitude>0.05 then
+                    root.CFrame=CFrame.new(position)*root.CFrame.Rotation
+                end
+                root.AssemblyLinearVelocity=Vector3.zero
+                root.AssemblyAngularVelocity=Vector3.zero
+            end
+        end)()
+
+
         -- Only steer camera in active, unlocked combat. The game's normal
         -- camera retains its type, so releasing the boss switch restores
         -- native camera control on the next frame.
         RunService:BindToRenderStep(renderName,
             Enum.RenderPriority.Last.Value+20,function()
+                if alive then weakHover() end
                 if not alive or not sharedFarmState.AutoBossVacuum
                     or not sharedFarmState.AutoBossAimVacuum
                     or not aimAllowed or not aimTarget then return end
