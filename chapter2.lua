@@ -1990,7 +1990,7 @@ end
                     root.CFrame=CFrame.new(target+Vector3.new(0,3.5,0))*root.CFrame.Rotation
                     root.AssemblyLinearVelocity=Vector3.zero
                     root.AssemblyAngularVelocity=Vector3.zero
-                    task.wait(0.375)
+                    task.wait(0.25)
                 end
                 for attempt=1,16 do
                     if confirmed() or hubUnloaded or not handInRequested() then break end
