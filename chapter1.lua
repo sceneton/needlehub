@@ -2737,9 +2737,46 @@ do
         end
         return self
     end    local function ensureReplayReload()
-        if _G.__BEYY_NEEDLEHUB_RELOAD_JOB==game.JobId then return true end
+        if _G.__BEYY_NEEDLEHUB_RELOAD_JOB==game.JobId
+            or _G.__BEYY_SCENETON_NEEDLEHUB_RELOAD_JOB==game.JobId then return true end
         local env=_G
         if type(getgenv)=="function" then local ok,value=pcall(getgenv);if ok and type(value)=="table" then env=value end end
+        -- Shared queue ownership also recognizes the two pre-fix guards.
+        local function armNeedleReload(globals,env,job,queue,payload,source)
+            local scopes={globals}
+            if env~=globals then scopes[#scopes+1]=env end
+            local keys={"__BEYY_SCENETON_NEEDLEHUB_RELOAD_JOB","__BEYY_NEEDLEHUB_RELOAD_JOB"}
+            local current=env.__BEYY_NEEDLEHUB_TELEPORT_OWNER
+            if type(current)=="table" and current.JobId==job and current.State~="failed" then
+                return true,"already armed"
+            end
+            for _,scope in ipairs(scopes) do
+                for _,key in ipairs(keys) do
+                    if scope[key]==job then return true,"already armed" end
+                end
+            end
+            if type(queue)~="function" then return false,"queue_on_teleport unavailable" end
+            local previous={}
+            local owner={JobId=job,State="arming",Source=source}
+            local oldOwner=env.__BEYY_NEEDLEHUB_TELEPORT_OWNER
+            env.__BEYY_NEEDLEHUB_TELEPORT_OWNER=owner
+            -- Claim before calling the executor: queue implementations may yield.
+            for _,scope in ipairs(scopes) do
+                for _,key in ipairs(keys) do
+                    previous[#previous+1]={Scope=scope,Key=key,Value=scope[key]}
+                    scope[key]=job
+                end
+            end
+            local ok,reply=pcall(queue,payload)
+            if ok and reply~=false then owner.State="armed";return true,"armed" end
+            if env.__BEYY_NEEDLEHUB_TELEPORT_OWNER==owner then
+                env.__BEYY_NEEDLEHUB_TELEPORT_OWNER=oldOwner
+                for _,entry in ipairs(previous) do entry.Scope[entry.Key]=entry.Value end
+            end
+            owner.State="failed"
+            return false,ok and "queue returned false" or tostring(reply)
+        end
+        
         local queue=(type(queue_on_teleport)=="function" and queue_on_teleport)
             or env.queue_on_teleport or env.queueonteleport or env.queue_on_tp
         if type(queue)~="function" then return false,"queue_on_teleport is unavailable" end
@@ -2763,42 +2800,54 @@ do
                 local success,runtimeError=pcall(fn)
                 if not success then warn("[AFK Test] Runtime error: "..tostring(runtimeError)) end
             ]==],sourceRef,sourceUrl)
-            local ok,err=pcall(queue,testPayload)
-            if ok then _G.__BEYY_NEEDLEHUB_RELOAD_JOB=game.JobId end
-            return ok,tostring(err)
+            return armNeedleReload(_G,env,game.JobId,queue,testPayload,"explicit replay test branch")
         end
         local payload=[====[
-        local H=game:GetService("HttpService")
-        local revision
-        local resolved,info=pcall(function()
-            return H:JSONDecode(game:HttpGet("https://api.github.com/repos/BeyyTU/needlehub/commits/main?refresh="..tostring(os.time()).."-"..tostring(math.random(1,1000000000))))
+-- NeedleHub canonical teleport bootstrap v1 SINGLE OWNER
+local env=(type(getgenv)=="function" and getgenv()) or _G
+local job=game.JobId
+local previous=env.__BEYY_NEEDLEHUB_TELEPORT_BOOT
+if type(previous)=="table" and previous.JobId==job and previous.State~="failed" then return end
+local boot={JobId=job,State="loading"}
+env.__BEYY_NEEDLEHUB_TELEPORT_BOOT=boot
+local callOk,succeeded,message=pcall(function()
+    if not game:IsLoaded() then game.Loaded:Wait() end
+    local H=game:GetService("HttpService")
+    local revision
+    local resolved,info=pcall(function()
+        return H:JSONDecode(game:HttpGet("https://api.github.com/repos/sceneton/needlehub/commits/main?refresh="..tostring(os.time()).."-"..tostring(math.random(1,1000000000))))
+    end)
+    if resolved and type(info)=="table" and type(info.sha)=="string" and #info.sha==40 and info.sha:match("^%x+$") then revision=info.sha end
+    local url="https://raw.githubusercontent.com/sceneton/needlehub/"..(revision or "main").."/loader.lua"
+    local function valid(body)
+        return type(body)=="string"
+            and body:find("https://raw.githubusercontent.com/sceneton/needlehub/",1,true)
+            and body:find('local VERSION = "103.00"',1,true)
+            and body:find("NeedleHub single-owner startup v1",1,true)
+            and body:find("afk_replay_loader_v103.lua",1,true) and loadstring(body)
+    end
+    local body
+    for attempt=1,3 do
+        local ok,value=pcall(function()
+            return game:HttpGet(url.."?refresh="..tostring(os.time()).."-"..tostring(math.random(1,1000000000)))
         end)
-        if resolved and type(info)=="table" and type(info.sha)=="string" and #info.sha==40 and info.sha:match("^%x+$") then revision=info.sha end
-        local url="https://raw.githubusercontent.com/BeyyTU/needlehub/"..(revision or "main").."/loader.lua"
-        local body
-        for attempt=1,3 do
-            local ok,source=pcall(function()
-                return game:HttpGet(url.."?refresh="..tostring(os.time()).."-"..tostring(math.random(1,1000000000)))
-            end)
-            if ok and type(source)=="string" and source:find('local VERSION = "103.00"',1,true)
-                and source:find("afk_replay_loader_v103.lua",1,true) and loadstring(source) then body=source;break end
-            if attempt<3 then task.wait(attempt*0.5) end
-        end
-        if not body and type(readfile)=="function" then
-            local ok,cached=pcall(readfile,"BeyyHub/afk_replay_loader_v103.lua")
-            if ok and type(cached)=="string" and cached:find('local VERSION = "103.00"',1,true)
-                and cached:find("afk_replay_loader_v103.lua",1,true) and loadstring(cached) then body=cached end
-        end
-        if not body then warn("[BeyyHub] No validated online or cached AFK router; reattach and rerun the loader");return end
-        if type(writefile)=="function" then pcall(writefile,"BeyyHub/afk_replay_loader_v103.lua",body) end
-        local compiled,compileError=loadstring(body)
-        if not compiled then warn("[BeyyHub] Teleport loader compile error: "..tostring(compileError));return end
-        local succeeded,runtimeError=pcall(compiled,revision)
-        if not succeeded then warn("[BeyyHub] Teleport loader error: "..tostring(runtimeError)) end
+        if ok and valid(value) then body=value;break end
+        if attempt<3 then task.wait(attempt*0.5) end
+    end
+    if not body and type(readfile)=="function" then
+        local ok,value=pcall(readfile,"BeyyHub/afk_replay_loader_v103.lua")
+        if ok and valid(value) then body=value end
+    end
+    if not body then return false,"No validated single-owner online or cached loader" end
+    if type(writefile)=="function" then pcall(writefile,"BeyyHub/afk_replay_loader_v103.lua",body) end
+    local compiled,compileError=loadstring(body)
+    if not compiled then return false,tostring(compileError) end
+    return pcall(compiled,revision)
+end)
+boot.State=callOk and succeeded and "loaded" or "failed"
+if boot.State=="failed" then warn("[BeyyHub] Teleport bootstrap failed: "..tostring(callOk and message or succeeded)) end
 ]====]
-        local ok,err=pcall(queue,payload)
-        if ok then _G.__BEYY_NEEDLEHUB_RELOAD_JOB=game.JobId end
-        return ok,tostring(err)
+        return armNeedleReload(_G,env,game.JobId,queue,payload,"sceneton replay fallback")
     end
     local function replayVoteRemote()
         local folder=game:GetService("ReplicatedStorage"):FindFirstChild("NeedleHaystack")
